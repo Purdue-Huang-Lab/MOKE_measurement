@@ -1,5 +1,17 @@
-# this is a pseudo code for a MOKE experiment control script
-# NOTE: I will use [t,y,x] indexing for the results array
+'''
+Code for conducting scanning tr-MOKE measurement.
+Focused probe light controlled by a galvo mirror, scanning the sample surface.
+Delay stage controlled by a Thorlabs BBD301 brushless motor, and DDS300 delay stage.
+HWP controlled by a Thorlabs K-cube.
+Reflected signal analyzed by a Zurich Instruments MFLI lock-in amplifier, referenced by chopper in the Aux input1.
+
+Magnetic field and temperature is not controlled by this code.
+
+Made by Hanjun, Purdue University, 2025.
+'''
+#%% import
+# NOTE: [t,y,x] indexing for the results array
+
 import numpy as np
 import time
 import sys
@@ -11,12 +23,12 @@ from t_bbd_ds import TL_ds as ds_class    # class for Thorlabs delay stage contr
 # K-cube for hwp
 from t_kcube import TL_kcube as kcube_class   # class for Thorlabs K-cube control, needed to auto-balance the balanced detector
 # Galvo for scanning
-# TODO: do this after installing galvo
+pass
 # import galvo_control as galvo
 sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_zurich_instrument')
 from zi_mfli import MFLI as lockin
 
-# functions, lower level for device control
+#%% functions, lower level for device control
 
 # I will move this to the working scirpt instead of in a library.
 def hwp_balance_by_scope(hwp: kcube_class, scope: lockin, tol_volt, tol_ang, step_ang, timeout):
@@ -25,6 +37,7 @@ def hwp_balance_by_scope(hwp: kcube_class, scope: lockin, tol_volt, tol_ang, ste
     Assumption:
         Initial angle is close. 
     '''
+    pass
 
 # functions, lower level functions for measurements
 
@@ -108,9 +121,15 @@ def run_experiment(ds_device,    # object of delay stage class
 def __main__():
     #%% read parameters
     #%% make devices
-    BBD_serial_number = '123456' # NOTE: replace with actual motor serial number
+    BBD_serial_number = '103507474' # NOTE: replace with actual motor serial number
     ds = ds_class(BBD_serial_number, NTRIP=4)     # NOTE: need 2 arguments: serial number and NTRIP
 
+    kcube_hwp_SN = '27600911'
+    hwp = kcube_class(kcube_hwp_SN)     # create hwp object
+
+    li_SN = 'DEV5849'
+    li_HOST = '10.164.14.211'
+    li = lockin(li_SN, li_HOST)  # create lock-in amplifier object
 
     # define parameters
     delay_array = np.linspace(0, 10, 100)  # example delay array
@@ -121,7 +140,6 @@ def __main__():
     # run the experiment
     results = run_experiment(ds, delay_array, gx0, gx1, dgx, gy0, gy1, dgy, t_measure_array)
     
-    # process results
-    other_packages.process_results(results)
+    # save results
     #%% close
     ds.close()  # close the delay stage device
