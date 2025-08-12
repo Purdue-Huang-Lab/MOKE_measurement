@@ -15,6 +15,7 @@ Made by Hanjun, Purdue University, 2025.
 import numpy as np
 import time
 import sys
+import moke_rig 
 
 # add device control packages
 # delay stage
@@ -31,92 +32,9 @@ from zi_mfli import MFLI as lockin
 #%% functions, lower level for device control
 
 # I will move this to the working scirpt instead of in a library.
-def hwp_balance_by_scope(hwp: kcube_class, scope: lockin, tol_volt, tol_ang, step_ang, timeout):
-    '''
-    Automatic balance a balanced detector through Zurich MFLI lock-in amplifier and Thorlabs K-Cube rotation mount.
-    Assumption:
-        Initial angle is close. 
-    '''
-    pass
-
-# functions, lower level functions for measurements
-
-def single_measurement(lockin_device, t_measure = 1):
-    print("Not implemented yet.")
-    return 
-
-def single_measurement_steady(galvo_device, bld_device, gx, gy, t_measure = 1):
-    galvo_device.set_position(gx, gy)  # set galvo position
-    result = bld_device.measure(t_measure)  # start balance detector measurement
-    # NOTE: I may need to sleep here to wait for the measurement to finish. Not sure how detector is implemented.
-    return result
-
-def single_measurement_lockin(galvo_device, lockin_device, gx, gy, t_measure = 1):
-    galvo_device.set_position(gx, gy)  # set galvo position
-    result = lockin_device.measure(t_measure)  # start lock-in measurement
-    # NOTE: I may need to sleep here to wait for the measurement to finish. Not sure how detector is implemented.
-    return result
-
-def sweep_y_measurement_steady(galvo_device, bld_device, gx, gy0, gy1, dgy, t_measure = 1):
-    n_data = np.round((gy1 - gy0) / dgy) + 1
-    results = np.zeros(n_data)
-    for igy, gy in enumerate(range(gy0, gy1 + 1, dgy)):
-        result = single_measurement_steady(galvo_device, bld_device, gx, gy, t_measure)
-        results[igy] = result
-    return results
-
-def sweep_xy_measurement_steady(galvo_device, bld_device, gx0, gx1, dgx, gy0, gy1, dgy, t_measure = 1):
-    n_data_x = np.round((gx1 - gx0) / dgx) + 1
-    n_data_y = np.round((gy1 - gy0) / dgy) + 1
-    results = np.zeros((n_data_y, n_data_x))
-    for igy, gy in enumerate(range(gy0, gy1 + 1, dgy)):
-        for igx, gx in enumerate(range(gx0, gx1 + 1, dgx)):
-            result = single_measurement_steady(galvo_device, bld_device, gx, gy, t_measure)
-            results[igy, igx] = result
-    return results
-
-def sweep_y_measurement_lockin(galvo_device, lockin_device, gx, gy0, gy1, dgy, t_measure = 1):
-    n_data = np.round((gy1 - gy0) / dgy) + 1
-    results = np.zeros(n_data)
-    for igy, gy in enumerate(range(gy0, gy1 + 1, dgy)):
-        result = single_measurement_lockin(galvo_device, lockin_device, gx, gy, t_measure)
-        results[igy] = result
-    return results
-
-def sweep_xy_measurement_lockin(galvo_device, lockin_device, gx0, gx1, dgx, gy0, gy1, dgy, t_measure = 1):
-    n_data_x = np.round((gx1 - gx0) / dgx) + 1
-    n_data_y = np.round((gy1 - gy0) / dgy) + 1
-    results = np.zeros((n_data_y, n_data_x))
-    for igy, gy in enumerate(range(gy0, gy1 + 1, dgy)):
-        for igx, gx in enumerate(range(gx0, gx1 + 1, dgx)):
-            result = single_measurement_lockin(galvo_device, lockin_device, gx, gy, t_measure)
-            results[igy, igx] = result
-    return results
-#%% functions, higher level for GUI integration
-def run_experiment(ds_device,    # object of delay stage class
-                   galvo_device: galvo.GalvoDevice,  # object of galvo control class
-                   lockin_device: lockin.LockInDevice,  # object of lock-in amplifier class
-                   delay_array: np.ndarray,
-                gx0: float, gx1: float, dgx: float,
-                gy0: float, gy1: float, dgy: float,
-                t_measure_array: np.ndarray):
-    # check size of delay_array and t_measure_array
-    if len(delay_array) != len(t_measure_array):
-        raise ValueError("delay_array and t_measure_array must have the same length")
-    # initialize 
-    n_frame = len(delay_array)
-    n_x = int(np.round((gx1 - gx0) / dgx)) + 1
-    n_y = int(np.round((gy1 - gy0) / dgy)) + 1
-    results = np.zeros((n_frame, n_y, n_x))
-    print("Start MOKE experiment:")
-    for i, delay in enumerate(delay_array):
-        # print notice
-        print(f"#{i} out of {n_frame} frame: delay {delay:.2f} ps for {t_measure_array[i]:.2f} s at each point. "
-              f"\nEstimated total time: {n_x * n_y * t_measure_array[i]:.2f} s")
-        # move delay stage
-        ds_device.move_t(delay)
-        results[i, :, :] = sweep_xy_measurement_lockin(galvo_device, lockin_device, gx0, gx1, dgx, gy0, gy1, dgy, t_measure_array[i])
-    return results
+#%% Other misc functions
+def press_enter_to_proceed():
+    input("Press Enter to proceed...")
 
 def __main__():
     #%% read parameters
@@ -131,6 +49,18 @@ def __main__():
     li_HOST = '10.164.14.211'
     li = lockin(li_SN, li_HOST)  # create lock-in amplifier object
 
+    galvo_device = None     # NOTE: add galvo later
+    rig = moke_rig.moke_rig(li, ds, galvo = galvo_device, hwp = hwp)   # create rig object. 
+    # pre-run checks. These are tasks that need to be manually done.
+    print(  '''
+            Pre-run checks:
+            Before running experiments, please check the following issues:
+            1. Is delay stage homed?
+            2. Is lock-in amplifier configured? 
+            3. Is hwp balanced?
+            4. (If running spatial-MOKE) Is galvo device initialized?
+            ''')
+    press_enter_to_proceed()
     # define parameters
     delay_array = np.linspace(0, 10, 100)  # example delay array
     gx0, gx1, dgx = 0, 10, 1
