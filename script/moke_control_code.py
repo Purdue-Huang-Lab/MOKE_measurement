@@ -15,7 +15,8 @@ Made by Hanjun, Purdue University, 2025.
 import numpy as np
 import time
 import sys
-import moke_rig 
+import moke_rig
+from hytools import hy_basic as hyb
 
 # add device control packages
 # delay stage
@@ -37,7 +38,9 @@ def press_enter_to_proceed():
     input("Press Enter to proceed...")
 
 def __main__():
-    #%% read parameters
+    #%% parameters
+    save_dir = r'F:\Git\MOKE_measurement\results'
+    hyb.check_make_dir(save_dir)  # make sure the save directory exists
     #%% make devices
     BBD_serial_number = '103507474' # NOTE: replace with actual motor serial number
     ds = ds_class(BBD_serial_number, NTRIP=4)     # NOTE: need 2 arguments: serial number and NTRIP
@@ -45,7 +48,7 @@ def __main__():
     kcube_hwp_SN = '27600911'
     hwp = kcube_class(kcube_hwp_SN)     # create hwp object
 
-    li_SN = 'DEV5849'
+    li_SN = 'dev5849'
     li_HOST = '10.164.14.211'
     li = lockin(li_SN, li_HOST)  # create lock-in amplifier object
 
@@ -63,13 +66,16 @@ def __main__():
     press_enter_to_proceed()
     # define parameters
     delay_array = np.linspace(0, 10, 100)  # example delay array
-    gx0, gx1, dgx = 0, 10, 1
-    gy0, gy1, dgy = 0, 10, 1
     t_measure_array = np.ones(len(delay_array))  # example measurement time array
 
     # run the experiment
-    results = run_experiment(ds, delay_array, gx0, gx1, dgx, gy0, gy1, dgy, t_measure_array)
-    
-    # save results
+    results = moke_rig.run_experiment_t(rig, delay_array, t_measure_array)
+
+    #%% save results
+    result_fname = f'{save_dir}\\lock_in_test.txt'
+    combined = np.zeros((results.shape[0], results.shape[1] + 1))
+    combined[:, 1:] = results           # Place the data matrix
+    combined[:, 0] = delay_array        # Place delay_array as the first row (excluding first cell)
+    np.savetxt(result_fname, combined, fmt="%.6g", delimiter="\t", header=['delay', 'r', 'phase', 'r_std', 'phase_std'])
     #%% close
     ds.close()  # close the delay stage device
