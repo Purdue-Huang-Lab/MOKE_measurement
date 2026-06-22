@@ -32,7 +32,7 @@ class moke_rig:
 
     #%% low level functions should be inside this class
     def single_measurement(self, t_measure = 1):
-        TIMING_RATIO = 2   # so far there is a timing mismatch. Measurement time is actually twice of the requested time in the measure method
+        TIMING_RATIO = 2   # NOTE: so far there is a timing mismatch. Measurement time is actually twice of the requested time in the measure method. Reason unknown.
         li = self.lockin
         r, phase, r_std, phase_std = li.measure_avg('polar', t_measure/TIMING_RATIO)
         return r, phase, r_std, phase_std
