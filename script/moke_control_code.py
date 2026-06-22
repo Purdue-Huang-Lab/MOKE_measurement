@@ -30,9 +30,6 @@ pass
 sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_zurich_instrument')
 from zi_mfli import MFLI as lockin
 
-#%% functions, lower level for device control
-
-# I will move this to the working scirpt instead of in a library.
 #%% Other misc functions
 def press_enter_to_proceed():
     input("Press Enter to proceed...")
@@ -52,7 +49,7 @@ def __main__():
     li_HOST = '10.164.14.211'
     li = lockin(li_SN, li_HOST)  # create lock-in amplifier object
 
-    galvo_device = None     # NOTE: add galvo later
+    galvo_device = None     # TODO: add galvo control later
     rig = moke_rig.moke_rig(li, ds, galvo = galvo_device, hwp = hwp)   # create rig object. 
     # pre-run checks. These are tasks that need to be manually done.
     print(  '''
