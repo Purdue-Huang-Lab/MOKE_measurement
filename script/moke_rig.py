@@ -1,5 +1,7 @@
 '''
-Experiment rigs for MOKE measurements
+Experiment rigs for MOKE measurements.
+MOKE rig contains all hardward necessary for performing MOKE experiments. MOKE righ does NOT contain any analysis functionality.
+
 '''
 #%% import
 import sys
@@ -21,22 +23,57 @@ from zi_mfli import MFLI as lockin
 #%% moke_rig class
 @dataclass
 class moke_rig:
+    # ----- Hard hardware requirements -----
     lockin: lockin
     delay_stage: ds_class
-    galvo: object = None
-    hwp: kcube_class = None     # these 2 are not necessary devices
+    # No connection needed: balanced detector.
+
+    # ----- Optional hardware requirements -----
+    galvo: object = None        # for spatial scanning.
+    hwp: kcube_class = None     # for automatic balancing the probe polarization.
 
     def __post_init__(self):
+        # sanity check
+        if self.lockin is None:
+            raise ValueError("Lock-in amplifier must be provided")
+        if self.delay_stage is None:
+            raise ValueError("Delay stage must be provided")
         # do some initialization
         self.t0 = 0
 
-    #%% low level functions should be inside this class
+    def initialize_hardwares(self):
+        ''' Initialize all hardware devices. '''
+        # initialize lock-in amplifier
+        self.lockin.initialize()
+        # initialize delay stage
+        self.delay_stage.initialize()
+        # initialize all optional hardware
+        if self.galvo is not None:
+            self.galvo.initialize()
+        if self.hwp is not None:
+            self.hwp.initialize()
+
+    def close_hardwares(self):
+        ''' Close all hardware devices. '''
+        # close lock-in amplifier
+        if self.lockin is not None:
+            self.lockin.close()
+        # close delay stage
+        if self.delay_stage is not None:
+            self.delay_stage.close()
+        # close optional hardware
+        if self.galvo is not None:
+            self.galvo.close()
+        if self.hwp is not None:
+            self.hwp.close()
+
+    #%% low level functions that need to be exposed here.
     def single_measurement(self, t_measure = 1):
-        TIMING_RATIO = 2   # NOTE: so far there is a timing mismatch. Measurement time is actually twice of the requested time in the measure method. Reason unknown.
+        TIMING_RATIO = 2   # BUG: so far there is a timing mismatch. Measurement time is actually twice of the requested time in the measure method. Reason unknown.
         li = self.lockin
         r, phase, r_std, phase_std = li.measure_avg('polar', t_measure/TIMING_RATIO)
         return r, phase, r_std, phase_std
-
+    #%% high-level functions
     def t_scan_no_t0_correction(self, t_raw:np.ndarray, t_measure:np.ndarray):
         '''
         Scan in time without T0 correction
@@ -68,7 +105,6 @@ class moke_rig:
             results[i,:] = result
         return results
 
-#%% high-level functions
     # def hwp_balance_by_scope(hwp: kcube_class, scope: lockin, tol_volt, tol_ang, step_ang, timeout):
     #     '''
     #     Automatic balance a balanced detector through Zurich MFLI lock-in amplifier and Thorlabs K-Cube rotation mount.
