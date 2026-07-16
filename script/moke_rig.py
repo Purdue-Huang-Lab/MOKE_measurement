@@ -21,37 +21,58 @@ sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_zurich_instrument')
 from zi_mfli import MFLI as lockin
 
 #%% moke_rig class
-@dataclass
 class moke_rig:
-    # ----- Hard hardware requirements -----
-    lockin: lockin
-    delay_stage: ds_class
-    # No connection needed: balanced detector.
-
-    # ----- Optional hardware requirements -----
-    galvo: object = None        # for spatial scanning.
-    hwp: kcube_class = None     # for automatic balancing the probe polarization.
+    """
+    Moke rig using balanced detector and lock-in amplifier.
+    Hard requirements:
+        lockin amplifier
+        optical delay stage
+    Optional requirements:
+        half wave plates
+        galvo mirror
+    No-connection requirements:
+        chopper
+    """
+    def __init__(self, lockin: lockin, delay_stage: ds_class, galvo: object = None, hwp: kcube_class = None):
+        '''
+        Initialization when making ths class.
+        Do NOT put any hardware initialization here, only coding.
+        '''
+        # hard requirements
+        self.lockin = lockin
+        self.delay_stage = delay_stage
+        # optional requirements
+        self.galvo = galvo
+        self.hwp = hwp
 
     def __post_init__(self):
+        '''
+        Post-initialization to check hardware connections and set initial states.
+        '''
         # sanity check
         if self.lockin is None:
             raise ValueError("Lock-in amplifier must be provided")
         if self.delay_stage is None:
             raise ValueError("Delay stage must be provided")
-        # do some initialization
-        self.t0 = 0
 
-    def initialize_hardwares(self):
-        ''' Initialize all hardware devices. '''
+
+    def initialize(self):
+        ''' 
+        Initialize all hardware devices and software states.
+        '''
         # initialize lock-in amplifier
-        self.lockin.initialize()
+        pass
         # initialize delay stage
-        self.delay_stage.initialize()
+        pass
         # initialize all optional hardware
         if self.galvo is not None:
-            self.galvo.initialize()
+            pass
         if self.hwp is not None:
-            self.hwp.initialize()
+            pass
+        # any remaining sanity check
+        pass
+        # any software initialization
+        self.t0 = 0
 
     def close_hardwares(self):
         ''' Close all hardware devices. '''
@@ -193,3 +214,45 @@ def run_experiment_t(rig, t_raw, t_measure):
     results = rig.t_scan_no_t0_correction(t_raw, t_measure)
     return results
 
+#%% camera-based MOKE
+# TBD
+
+class Moke_Rig_Camera:
+    '''
+    Moke rig using lock-in camera instead of lock-in amplifier to achieve wide-field imaging
+    Hard requirements:
+        lockin camera
+        optical delay stage
+    Optional requirements:
+        half wave plates
+    No-connection requirements:
+        chopper
+        
+    '''
+    def __init__(self, delay_stage, li_camera=None, hwp=None):
+        self.li_camera = li_camera
+        self.delay_stage = delay_stage
+        self.hwp = hwp
+
+    def __post_init__(self):
+        if self.delay_stage is None:
+            raise ValueError('Delay stage must be specified')
+        if self.li_camera is None:
+            raise ValueError('Lock-in camera must be specified')
+        
+    
+    def initialize(self):
+        ''' 
+        Initialize all hardware devices and software states.
+        '''
+        # initialize lock-in camera
+        pass
+        # initialize delay stage
+        pass
+        # initialize all optional hardware
+        if self.hwp is not None:
+            pass
+        # any remaining sanity check
+        pass
+        # any software initialization
+        self.t0 = 0
