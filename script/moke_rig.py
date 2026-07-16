@@ -5,7 +5,6 @@ MOKE rig contains all hardward necessary for performing MOKE experiments. MOKE r
 '''
 #%% import
 import sys
-from dataclasses import dataclass
 import numpy as np
 
 # add device control packages
