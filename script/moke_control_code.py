@@ -13,20 +13,20 @@ Made by Hanjun, Purdue University, 2025.
 # NOTE: [t,y,x] indexing for the results array
 
 import numpy as np
-import time
 import sys
 import moke_rig
 from hytools import hy_basic as hyb
 
 # add device control packages
+# TODO: ideally we don't need to expose any hardware interface except for moke_rig class.
 # delay stage
-sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_thorlabs')
+sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_thorlabs')  # TODO: in a stable version, these codes will be integrated.
 from t_bbd_ds import TL_ds as ds_class    # class for Thorlabs delay stage control
 # K-cube for hwp
 from t_kcube import TL_kcube as kcube_class   # class for Thorlabs K-cube control, needed to auto-balance the balanced detector
 # Galvo for scanning
 pass
-# import galvo_control as galvo
+# lock in amplifier
 sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_zurich_instrument')
 from zi_mfli import MFLI as lockin
 
