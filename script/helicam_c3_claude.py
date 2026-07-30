@@ -462,3 +462,5 @@ class HeliCamC3:
             # Amplitude volume or unknown mode — return as-is.
             return data
 
+if __name__ == "__main__":
+    print("This module is intended to be imported, not run directly.")
