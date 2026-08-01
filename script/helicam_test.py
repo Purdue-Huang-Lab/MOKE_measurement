@@ -1,4 +1,4 @@
-from helicam_c3_claude import HeliCamC3 as hcam
+from script.helicam_c3 import HeliCamC3 as hcam
 import numpy as np
 import logging
 import matplotlib.pyplot as plt
@@ -10,7 +10,7 @@ _log = logging.getLogger(__name__)
 with hcam("c3cam_sl70") as cam:          # opens; closes even if this block raises
     _log.info("Camera opened")
 
-    cam.prepare_measurement_mode("steady")   # sets mode, AllocCamData
+    cam.set_measurement_mode("steady")   # sets mode, AllocCamData
     _log.info("Camera prepared for measurement mode")
 
     cam.flush()                              # drain stale USB frames (bounded)

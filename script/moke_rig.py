@@ -6,6 +6,8 @@ MOKE rig contains all hardward necessary for performing MOKE experiments. MOKE r
 #%% import
 import sys
 import numpy as np
+import matplotlib.pyplot as plt
+import time
 
 # add device control packages
 # delay stage
@@ -32,7 +34,7 @@ class moke_rig:
     No-connection requirements:
         chopper
     """
-    def __init__(self, lockin: lockin, delay_stage: ds_class, galvo: object = None, hwp: kcube_class = None):
+    def __init__(self, lockin: lockin, delay_stage: ds_class, galvo = None, hwp: kcube_class = None):
         '''
         Initialization when making ths class.
         Do NOT put any hardware initialization here, only coding.
@@ -216,42 +218,169 @@ def run_experiment_t(rig, t_raw, t_measure):
 #%% camera-based MOKE
 # TBD
 
-class Moke_Rig_Camera:
+class moke_camera_rig:
     '''
     Moke rig using lock-in camera instead of lock-in amplifier to achieve wide-field imaging
     Hard requirements:
-        lockin camera
-        optical delay stage
+        lockin camera (represented by LiCam class)
+        optical delay stage (represented by TL_ds class)
     Optional requirements:
-        half wave plates
+        half wave plates use a k-cube controller.
     No-connection requirements:
         chopper
         
     '''
     def __init__(self, delay_stage, li_camera=None, hwp=None):
-        self.li_camera = li_camera
-        self.delay_stage = delay_stage
+        self.licam = li_camera
+        self._licamtype = li_camera.type
+        self.ds = delay_stage
+        self._dsType = delay_stage.type
         self.hwp = hwp
 
     def __post_init__(self):
-        if self.delay_stage is None:
+        if self.ds is None:
             raise ValueError('Delay stage must be specified')
-        if self.li_camera is None:
+        if self.licam is None:
             raise ValueError('Lock-in camera must be specified')
         
-    
+    # ----- life cycle -----
     def initialize(self):
         ''' 
         Initialize all hardware devices and software states.
         '''
         # initialize lock-in camera
-        pass
+        self.licam.initialize()
         # initialize delay stage
-        pass
+        self.ds.initialize()
         # initialize all optional hardware
         if self.hwp is not None:
-            pass
+            self.hwp.initialize()
         # any remaining sanity check
         pass
         # any software initialization
         self.t0 = 0
+        print("MOKE camera rig initialized.")
+
+    def close(self):
+        ''' Close all hardware devices. '''
+        # close lock-in camera
+        self.licam.close()
+        # close delay stage
+        self.ds.close()
+        # close optional hardware
+        if self.hwp is not None:
+            self.hwp.close()
+
+    # ----- parameterize -----
+    def set_camera_steady_state(self):
+        ''' Set the lock-in camera to steady state mode. '''
+        self.licam.set_measurement_mode("steady")
+
+    def set_camera_lockin_mode(self):
+        pass    # TBD
+
+    def set_camera_parameter(self, **kwargs):
+        # NOTE: double check syntax
+        self.licam.set_attributes(**kwargs)
+
+    # NOTE: prefer to directly use the lock-in camera's own methods to set parameters, instead of wrapping them here. This is to avoid confusion and redundancy.
+
+    # ----- measurement -----
+    def camera_acquire(self):
+        return self.licam.acquire()
+
+    def camera_stream_frame(self, timeout=300, interval=0.05, autoscale=True):
+        ''' Preview the lock-in camera image. Usually used in alignment.
+        Time out in seconds. Default is 300 seconds. '''
+        fig, ax = plt.subplots()
+        ax.clear()
+
+        frame = self.camera_acquire()          # <- your acquisition call
+        im = ax.imshow(frame, cmap='gray', interpolation='nearest')
+        plt.figure.colorbar(im, ax=ax)
+        title = ax.set_title('t = 0.0 s')
+
+        plt.ion()
+        plt.figure.show()
+
+        t0 = next_t = time.monotonic()
+        n = 0
+        try:
+            while True:
+                elapsed = time.monotonic() - t0
+                if elapsed >= timeout:
+                    break
+                if not plt.fignum_exists(plt.figure.number):   # user closed the window
+                    break
+
+                frame = self.camera_acquire()
+                im.set_data(frame)
+                if autoscale:
+                    im.set_clim(frame.min(), frame.max())
+                title.set_text(f't = {elapsed:5.1f} s | frame {n} | '
+                            f'max {frame.max():g}')
+
+                fig.canvas.draw_idle()
+                fig.canvas.flush_events()
+                n += 1
+
+                next_t += interval
+                time.sleep(max(0.0, next_t - time.monotonic()))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            plt.ioff()
+
+        return n
+    
+    def camera_acquire_frame(self, t_acquire = 1.0):
+        """
+        Measure a single frame with current setting
+        """
+        self.licam.set_acquire_time(t_acquire)
+        raw = self.licam.acquire()
+        img = self.licam.to_numpy(raw)
+        return img
+
+    def measure_frame_at_time(self, t_delay, t_acquire):
+        """
+        Move delay stage to t_delay, acquire a frame with t_acquire
+        """
+        self.ds.goto_t(t_delay)
+        img = self.camera_acquire_frame(t_acquire)
+        return img
+
+    def measure_delta(self, n_pair, t_acquire, method, method_dict):
+        """
+        Measure delta signal with n_pair of frames, each frame with t_acquire.
+        The "method" argument defines how to determine pump / un-pump frames. The "method" argument is supported by a "method_dict" dictionary.
+            "even_odd": even frames are pump, odd frames are un-pump, or vice versa. Requires a "pump_first" boolean in method_dict to indicate whether the first frame is pump or un-pump. 
+            "reference_roi": use a reference region on camera to determine pump / un-pump frames. Requires 4 keys in method_dict: "x_center", "y_center", "width", "height" to define the reference ROI. 
+                Frames with stronger signal in the reference ROI are considered pump frames, and weaker signal are considered un-pump frames.
+        """
+        assert method in ["even_odd", "reference_roi"], "method must be either 'even_odd' or 'reference_roi'"
+        pass
+
+    def measure_delta_at_time(self, t_delay, n_pair, t_acquire, method, method_dict):
+        """
+        Move delay stage to t_delay, measure delta signal with n_pair of frames, each frame with t_acquire.
+        See measure_delta() for details on method and method_dict.
+        """
+        self.ds.goto_t(t_delay)
+        delta = self.measure_delta(n_pair, t_acquire, method, method_dict)
+        return delta
+
+    def scan_delta(self, t_delay_array, n_pair_array, t_acquire, method, method_dict):
+        """
+        Scan delay stage to t_delay_array, measure delta signal with n_pair of frames at each delay, each frame with t_acquire.
+        See measure_delta() for details on method and method_dict.
+        """
+        t_delay_array = np.asarray(t_delay_array)
+        n_pair_array = np.asarray(n_pair_array)
+        assert t_delay_array.size == n_pair_array.size, "t_delay_array and n_pair_array must have the same size"
+        deltas = []
+        for t_delay, n_pair in zip(t_delay_array, n_pair_array):
+            delta = self.measure_delta_at_time(t_delay, n_pair, t_acquire, method, method_dict)
+            deltas.append(delta)
+        return np.array(deltas)
+# %%

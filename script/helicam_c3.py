@@ -284,6 +284,18 @@ class HeliCamC3:
         """Apply DEFAULT_SETTINGS to the camera."""
         self.set_attributes(**self.DEFAULT_SETTINGS)
 
+    def get_image_shape(self) -> tuple[int, int]:
+        """
+        Get the expected shape of the image returned by to_numpy().
+
+        Returns
+        -------
+        tuple[int, int]
+            (height, width) of the image array.
+        """
+        pass
+
+
     # ------------------------------------------------------------------
     # 3. Helpers
     # ------------------------------------------------------------------
@@ -307,7 +319,21 @@ class HeliCamC3:
     # 4. Measurement
     # ------------------------------------------------------------------
 
-    def prepare_measurement_mode(self, modedesc, **kwargs):
+    def set_roi(self, x0: int, y0: int, width: int, height: int) -> None:
+        # NOTE: check if it is possible.
+        """
+        Set the camera's region of interest (ROI).
+
+        Parameters
+        ----------
+        x0, y0:
+            Top-left corner of the ROI in pixels. Must be within the sensor bounds.
+        width, height:
+            Size of the ROI in pixels. Must be positive and fit within the sensor bounds.
+        """
+        pass
+
+    def set_measurement_mode(self, modedesc, **kwargs):
         """
         Helper function to prepare camera measurement mode.
         Argument:
@@ -321,7 +347,7 @@ class HeliCamC3:
         - **kwargs:
             Override any mode-specific setting, e.g. SensNFrames=100.
         """
-        self._require_open("prepare_measurement_mode")
+        self._require_open("set_measurement_mode")
 
         intensity_alias = ["intensity", "steady"]
         minimum_energy_alias = ["minimum_energy", "minE"]
