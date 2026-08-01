@@ -12,6 +12,32 @@ import numpy as np
 
 _log = logging.getLogger(__name__)
 
+# SDK message "param" kind, low 8 bits (see Heliotis Python example
+# libHeLIC_setCallback.py). msg == 0x01 (CM_MSG_DISPLAY) is the only kind
+# that carries a human-readable string in `data`.
+_CM_MSG_DISPLAY = 0x01
+_SDK_MSG_KIND_NAMES = {
+    0x00: "DEBUG_STRING",
+    0x01: "BOX_INFO",
+    0x02: "BOX_WARN",
+    0x03: "BOX_ERR",
+}
+
+
+def _sdk_message_callback(hdl, msg, param, data):
+    """HE_SetCallback target: logs the SDK's human-readable message instead
+    of letting it show a blocking popup (see programmer manual, "Warnings
+    and error messages")."""
+    kind = param & 0xFF
+    text = ""
+    if msg == _CM_MSG_DISPLAY and data:
+        raw = ct.cast(data, ct.c_char_p).value
+        text = raw.decode("utf-8", errors="replace") if raw else ""
+    kind_name = _SDK_MSG_KIND_NAMES.get(kind, hex(kind))
+    level = logging.WARNING if kind in (0x02, 0x03) else logging.DEBUG
+    _log.log(level, "SDK message [%s]: %s", kind_name, text)
+    return 0
+
 # Prefer the local wrapper/ directory that ships with this repo; fall back to
 # the SDK installation so the module works when deployed without the source tree.
 _local_wrapper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrapper")
@@ -61,12 +87,17 @@ class HeliCamC3:
         "AcqStop":       0,     # 0=acquisition running, 1=stopped (power-on default is 1)
     }
 
+    # Values below are the ones heliViewer used for a confirmed-good capture on
+    # this camera (serial 1002688069) and were verified end-to-end from Python.
+    # AcqStop must stay last: prepare_measurement_mode() halts acquisition
+    # (AcqStop=1), writes everything else, then restarts with this AcqStop=0.
     STEADY_SETTINGS = {
         "CamMode":         3,   # intensity mode — camera behaves like a standard 2D camera
-        "SensNFrames":    50,   # total frames; useful HDR output = SensNFrames - SensNDarkFrames - 3
-        "SensNDarkFrames":10,   # dark frames taken; must be >= 7 and <= SensNFrames - 4
-        "SensExpTime":   100,   # short exposure time [µs]; actual = SensExpTime * (SensExpTimeMult+1)
-        "SensExpTimeMult": 1,   # exposure time multiplier; actual exposure = SensExpTime * (SensExpTimeMult+1)
+        "SensNFrames":   385,   # total frames; useful HDR output = SensNFrames - SensNDarkFrames - 3
+        "SensNDarkFrames": 7,   # dark frames taken; must be >= 7 and <= SensNFrames - 4
+        "SensExpTime":     1,   # short exposure time [µs]; actual = SensExpTime * (SensExpTimeMult+1)
+        "SensExpTimeMult": 0,   # exposure time multiplier; actual exposure = SensExpTime * (SensExpTimeMult+1)
+        "SensExpRatio":    3,   # dead time to comply with the frame rate
         "BSEnable":        0,   # must be 0 for intensity mode (manual §5.4)
         "TrigFreeExtN":    1,   # free-running for continuous steady-state capture
         "TrigExtSrcSel":   0,   # always 0 per SDK examples
@@ -82,6 +113,23 @@ class HeliCamC3:
         "OffsetMethod":  0,
     }
 
+    # --- Physical / calibration constants, used by estimate_acquire_time() ---
+
+    SENSOR_HEIGHT = 300     # helioct3 sensor, per SysDesc.xml (size="300 300")
+    SENSOR_WIDTH  = 300
+
+    SEQUENCER_CLOCK_HZ = 35e6   # clock FrmDur35MHz / TDemodCyc35MHz are counted in
+
+    # Sustained USB 2.0 bulk throughput, measured on camera 1002688069:
+    # 36.5 MB/s, constant to within 0.3% over 100/200/385-frame acquisitions.
+    # Acquisition in the volume modes is transfer-bound, so this — not the
+    # sensor — sets the wall time. Retune if moved to another USB controller.
+    USB_THROUGHPUT_BPS = 36.5e6
+
+    # Fallback frame duration when the camera is closed and FrmDur35MHz cannot
+    # be read: 23364 ticks / 35 MHz as configured by STEADY_SETTINGS.
+    NOMINAL_FRAME_DURATION_S = 23364 / 35e6   # 667.5 us
+
     # Map from CamMode to the expected CamDataFmt for AllocCamData.
     _MODE_TO_FMT = {
         0: "DF_I16Q16",   # raw IQ
@@ -93,13 +141,16 @@ class HeliCamC3:
     }
 
 
-    def __init__(self, sys_id: str = "c3cam", timeout_ms: int = 2000):
+    def __init__(self, sys_id: str = "c3cam_sl70", timeout_ms: int = 2000):
         """
         Parameters
         ----------
         sys_id:
-            Camera system identifier string passed to HE_Open, e.g.
-            ``'c3cam_sl70'``, ``'c3cam'``.
+            Camera system identifier string passed to HE_Open. Must match an
+            entry in ``C:\\ProgramData\\Heliotis\\devDesc\\SysDesc.xml``:
+            ``'c3cam_sl70'`` (current hardware), ``'c3cam'`` (older sl50),
+            ``'c3cam_sl110'``, ``'c3cam_se80'``. A wrong identifier does *not*
+            raise — HE_Open returns 0 and leaves the handle NULL (see open()).
         timeout_ms:
             Acquisition timeout in milliseconds (0 = no timeout).
         """
@@ -107,6 +158,11 @@ class HeliCamC3:
         self._timeout_ms = timeout_ms
         self._lib = LibHeLIC()
         self._is_open = False
+        # Keep a reference to the ctypes callback alive for the lifetime of
+        # this object — otherwise it can be garbage-collected and leave the
+        # SDK holding a dangling function pointer.
+        self._sdk_cb = self._lib.funcCBType(_sdk_message_callback)
+        self._lib.SetCallback(self._sdk_cb)
 
     # ------------------------------------------------------------------
     # 1. Device lifecycle
@@ -116,26 +172,37 @@ class HeliCamC3:
         """
         Power on / initialise the camera.
 
-        Opens the USB connection, downloads firmware if needed, and applies
-        the default settings.
+        Opens the USB connection and downloads the FPGA firmware.
+
+        Success is determined by the **handle**, not by the return code.
+        HE_Open returns a non-zero status (1) on a healthy open of this
+        camera, so a ``res != 0`` test rejects working hardware. The real
+        failure mode — e.g. a sys_id that does not match the attached
+        camera — returns 0 and leaves the handle NULL, after logging
+        "FPGA download failed" through the SDK callback.
 
         Returns
         -------
         int
-            Return code from HE_Open (0 = success).
+            Raw return code from HE_Open. Informational only.
 
         Raises
         ------
         RuntimeError
-            If the camera fails to open.
+            If HE_Open did not produce a usable handle.
         """
         _log.debug("Opening %s", self._sys_id)
         res = self._lib.Open(0, sys=self._sys_id)
-        if res != 0:
-            raise RuntimeError(f"HE_Open failed with code {res} for '{self._sys_id}'")
+        handle = getattr(self._lib.handle, "value", self._lib.handle)
+        if not handle:
+            raise RuntimeError(
+                f"HE_Open produced a NULL handle for '{self._sys_id}' (res={res}). "
+                f"The sys_id likely does not match the attached camera; valid ids "
+                f"are listed in SysDesc.xml."
+            )
         self._is_open = True
         self._lib.SetTimeout(self._timeout_ms)
-        _log.info("Camera '%s' opened (handle=%s)", self._sys_id, self._lib.handle)
+        _log.info("Camera '%s' opened (handle=0x%x, res=%s)", self._sys_id, handle, res)
         return res
 
     def close(self) -> int:
@@ -272,7 +339,12 @@ class HeliCamC3:
         else:
             raise ValueError(f"Unsupported measurement mode: {modedesc}")
 
+        # Halt acquisition before touching the sensor registers, then restart
+        # it via the trailing AcqStop=0 in `settings` — the order heliViewer
+        # uses for a known-good capture.
+        self.set_attributes(AcqStop=1)
         settings = {**base, **kwargs}
+        settings.setdefault("AcqStop", 0)
         self.set_attributes(**settings)
 
         fmt = LibHeLIC.CamDataFmt[self._MODE_TO_FMT[cam_mode]]
@@ -361,13 +433,22 @@ class HeliCamC3:
         self.set_attributes(SensTqp=SensTqp)
         _log.info("Set demodulation frequency to %.1f Hz (SensTqp=%d)", freq, SensTqp)
 
-    def flush(self) -> int:
+    def flush(self, max_frames: int = 3) -> int:
         """
         Drain stale frames from the USB buffer.
 
         Must be called after ``prepare_measurement_mode()`` and before the first
         real ``acquire()`` call, otherwise the first frame may contain leftover
         data from a previous session.
+
+        The loop is bounded on purpose. In free-running mode (``TrigFreeExtN=1``)
+        the camera always has another frame ready, so an unbounded
+        ``while Acquire() > 0`` never terminates.
+
+        Parameters
+        ----------
+        max_frames:
+            Upper bound on frames to discard.
 
         Returns
         -------
@@ -376,7 +457,9 @@ class HeliCamC3:
         """
         self._require_open("flush")
         count = 0
-        while self._lib.Acquire() > 0:
+        for _ in range(max_frames):
+            if self._lib.Acquire() <= 0:
+                break
             count += 1
         _log.info("Flushed %d stale frame(s) from USB buffer", count)
         return count
@@ -398,16 +481,131 @@ class HeliCamC3:
 
         Notes
         -----
+        HE_Acquire returns the **number of bytes transferred**, not a status
+        code: a large positive value is success, ``<= 0`` is a timeout or
+        missed trigger. For 385 frames of 300x300 I/Q uint16 this is
+        385*300*300*2*2 + 2496 bytes of header = 138,602,496.
+
         For IQ-based modes (CamMode 0 and 3) the uint16 view must be reinterpreted
         as int16 before arithmetic — ``to_numpy()`` handles this automatically.
         """
         self._require_open("acquire")
-        res = self._lib.Acquire()
-        if res != 0:
-            _log.warning("Acquire returned %d (timeout or no trigger)", res)
+        n_bytes = self._lib.Acquire()
+        if n_bytes <= 0:
+            _log.warning("Acquire returned %d (timeout or no trigger)", n_bytes)
             return None
+        _log.debug("Acquired %d bytes", n_bytes)
         self._lib.ProcessCamData(1, 0, 0)
         return self._lib.GetCamArr(1)
+
+    def _frame_duration_s(self) -> float:
+        """
+        Duration of one sensor frame in seconds.
+
+        Prefers the hardware's own FrmDur35MHz register (ticks of the 35 MHz
+        sequencer clock). Falls back to the demodulation formula
+        ``Nc / f_d``, with ``Nc = SensNavM2*2 + 2`` and
+        ``f_d = 70 MHz / (8*(SensTqp + 30))``, which agrees with the register
+        to ~1% on this camera.
+        """
+        if self._is_open:
+            try:
+                ticks = self.get_attribute("FrmDur35MHz")
+                if ticks > 0:
+                    return ticks / self.SEQUENCER_CLOCK_HZ
+            except Exception:
+                pass
+            try:
+                n_cycles = self.get_attribute("SensNavM2") * 2 + 2
+                f_demod = 70e6 / (8 * (self.get_attribute("SensTqp") + 30))
+                return n_cycles / f_demod
+            except Exception:
+                pass
+        return self.NOMINAL_FRAME_DURATION_S
+
+    def _payload_bytes(self, cam_mode: int, n_frames: int) -> int:
+        """
+        Bytes transferred over USB for one acquisition in the given CamMode.
+
+        Volume modes stream every frame; the surface modes (4, 7) do the
+        peak-finding on the FPGA and return only a collapsed 2D surface, so
+        their payload does not scale with SensNFrames.
+        """
+        px = self.SENSOR_HEIGHT * self.SENSOR_WIDTH
+        if cam_mode in (0, 3):        # DF_I16Q16  — full I/Q volume
+            return n_frames * px * 2 * 2
+        if cam_mode == 1:             # DF_A16     — amplitude volume
+            return n_frames * px * 2
+        if cam_mode in (4, 7):        # DF_A16Z16  — collapsed surface
+            return px * 2 * 2
+        if cam_mode == 5:             # DF_Z16A16P16 — Z/A/phase over a window
+            hwin = 5
+            if self._is_open:
+                try:
+                    hwin = self.get_attribute("ExSimpMaxHwin")
+                except Exception:
+                    pass
+            return px * (2 * hwin + 1) * 3 * 2
+        return n_frames * px * 2 * 2  # unknown mode — assume full volume
+
+    def estimate_acquire_time(self, n_frames: int = None, cam_mode: int = None) -> float:
+        """
+        Estimate how long a single ``acquire()`` will take, in seconds.
+
+        Sensing and USB transfer are pipelined, so the wall time is set by
+        whichever dominates::
+
+            sensor   = SensNFrames * FrmDur35MHz / 35 MHz
+            transfer = payload_bytes / USB_THROUGHPUT_BPS
+            estimate = max(sensor, transfer)
+
+        For the volume modes (0, 1, 3) transfer dominates heavily — a 385-frame
+        intensity acquisition senses for 257 ms but moves 138.6 MB, taking
+        ~3.8 s. For the surface modes (4, 7) the FPGA returns only a 2D surface,
+        so sensing dominates instead.
+
+        Parameters
+        ----------
+        n_frames:
+            Frame count to estimate for. Defaults to the camera's live
+            SensNFrames when open, else the STEADY_SETTINGS value.
+        cam_mode:
+            CamMode to estimate for. Defaults to the mode set by the most
+            recent ``prepare_measurement_mode()``, else the live register.
+
+        Returns
+        -------
+        float
+            Estimated seconds per acquisition.
+
+        Notes
+        -----
+        Calibrated against measurements on camera 1002688069 at 36.5 MB/s
+        (USB 2.0 bulk), accurate to within ~0.3% for CamMode 3 at 100/200/385
+        frames. The surface-mode branch follows the documented data formats but
+        has not been measured. Throughput is a property of the link, so retune
+        ``USB_THROUGHPUT_BPS`` if the camera is moved to a different controller.
+        """
+        if n_frames is None:
+            n_frames = (self.get_attribute("SensNFrames") if self._is_open
+                        else self.STEADY_SETTINGS["SensNFrames"])
+        if cam_mode is None:
+            cam_mode = getattr(self, "_current_cammode", None)
+            if cam_mode is None:
+                cam_mode = (self.get_attribute("CamMode") if self._is_open
+                            else self.STEADY_SETTINGS["CamMode"])
+
+        sensor_s = n_frames * self._frame_duration_s()
+        payload = self._payload_bytes(cam_mode, n_frames)
+        transfer_s = payload / self.USB_THROUGHPUT_BPS
+        estimate = max(sensor_s, transfer_s)
+
+        _log.debug(
+            "estimate_acquire_time: CamMode=%s N=%d -> %.3fs "
+            "(sensor %.3fs, transfer %.3fs for %.1f MB)",
+            cam_mode, n_frames, estimate, sensor_s, transfer_s, payload / 1e6,
+        )
+        return estimate
 
     # ------------------------------------------------------------------
     # 5. Data processing
