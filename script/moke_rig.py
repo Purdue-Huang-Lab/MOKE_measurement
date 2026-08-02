@@ -277,13 +277,13 @@ class moke_camera_rig:
         self.licam.set_measurement_mode("steady")
 
     def set_camera_lockin_mode(self):
-        pass    # TBD
+        self.licam.set_measurement_mode("minimum_energy")    
 
     def set_camera_parameter(self, **kwargs):
         # NOTE: double check syntax
+        # NOTE: prefer to directly use the lock-in camera's own methods to set parameters, instead of wrapping them here. This is to avoid confusion and redundancy.
         self.licam.set_attributes(**kwargs)
 
-    # NOTE: prefer to directly use the lock-in camera's own methods to set parameters, instead of wrapping them here. This is to avoid confusion and redundancy.
 
     # ----- measurement -----
     def camera_acquire(self):
@@ -338,7 +338,7 @@ class moke_camera_rig:
         Measure a single frame with current setting
         """
         self.licam.set_acquire_time(t_acquire)
-        raw = self.licam.acquire()
+        raw = self.licam.acquire_single()
         img = self.licam.to_numpy(raw)
         return img
 
@@ -370,6 +370,21 @@ class moke_camera_rig:
         delta = self.measure_delta(n_pair, t_acquire, method, method_dict)
         return delta
 
+    def measure_delta_at_time_avg(self, reps, t_delay, n_pair, t_acquire, method, method_dict):
+        """
+        Measure delta signal with n_pair of frames, each frame with t_acquire, at t_delay, and repeat for reps times. Average the results.
+        """
+        assert reps >= 1, "reps must be positive"
+        reps = int(reps)
+        size = self.licam.get_image_shape()
+        deltas = np.zeros((reps, size[0], size[1]))   # [rep, y, x] indexing
+        for i in range(reps):
+            delta = self.measure_delta_at_time(t_delay, n_pair, t_acquire, method, method_dict)
+            deltas[i] = delta
+        delta_avg = np.mean(deltas, axis=0)
+        stds = np.std(deltas, axis=0)
+        return delta_avg, stds
+
     def scan_delta(self, t_delay_array, n_pair_array, t_acquire, method, method_dict):
         """
         Scan delay stage to t_delay_array, measure delta signal with n_pair of frames at each delay, each frame with t_acquire.
@@ -378,9 +393,10 @@ class moke_camera_rig:
         t_delay_array = np.asarray(t_delay_array)
         n_pair_array = np.asarray(n_pair_array)
         assert t_delay_array.size == n_pair_array.size, "t_delay_array and n_pair_array must have the same size"
-        deltas = []
-        for t_delay, n_pair in zip(t_delay_array, n_pair_array):
+        size = self.licam.get_image_shape()
+        deltas = np.zeros((t_delay_array.size, size[0], size[1]))   # [t, y, x] indexing
+        for i, (t_delay, n_pair) in enumerate(zip(t_delay_array, n_pair_array)):
             delta = self.measure_delta_at_time(t_delay, n_pair, t_acquire, method, method_dict)
-            deltas.append(delta)
-        return np.array(deltas)
+            deltas[i] = delta
+        return deltas
 # %%

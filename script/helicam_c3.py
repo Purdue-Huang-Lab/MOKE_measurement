@@ -293,7 +293,7 @@ class HeliCamC3:
         tuple[int, int]
             (height, width) of the image array.
         """
-        pass
+        return self.SENSOR_HEIGHT, self.SENSOR_WIDTH
 
 
     # ------------------------------------------------------------------
@@ -490,7 +490,7 @@ class HeliCamC3:
         _log.info("Flushed %d stale frame(s) from USB buffer", count)
         return count
 
-    def acquire(self):
+    def _acquire(self):
         """
         Trigger one acquisition and return the processed data as a numpy array.
 
@@ -523,6 +523,41 @@ class HeliCamC3:
         _log.debug("Acquired %d bytes", n_bytes)
         self._lib.ProcessCamData(1, 0, 0)
         return self._lib.GetCamArr(1)
+
+    def acquire_single(self):
+        """
+        Helper function to acquire a single frame and return it as a numpy array.
+        """
+        self._require_open("acquire_single")
+        self.flush()
+        data = self._acquire()
+        if data is None:
+            return None
+        return self.to_numpy(data)
+
+    def acquire_avg(self, n_frames: int = 10):
+        """
+        Acquire multiple frames in a loop and return their average.
+        """
+        self._require_open("continuous_acquire")
+        self.flush()
+
+        acc = None
+        count = 0
+        for _ in range(n_frames):
+            data = self._acquire()
+            if data is None:
+                continue
+            np_data = self.to_numpy(data)
+            if acc is None:
+                acc = np_data.astype(np.float64)
+            else:
+                acc += np_data
+            count += 1
+        if count == 0:
+            return None
+        return acc / count
+
 
     def _frame_duration_s(self) -> float:
         """
