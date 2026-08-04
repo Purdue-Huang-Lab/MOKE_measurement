@@ -4,6 +4,7 @@ MOKE rig contains all hardward necessary for performing MOKE experiments. MOKE r
 
 '''
 #%% import
+import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,7 +21,8 @@ pass
 # import galvo_control as galvo
 sys.path.insert(0, r'F:\Git\optical_devices_toolbox\scripts_zurich_instrument')
 from zi_mfli import MFLI as lockin
-
+# import lockin_fixed as lockin
+import helicam_c3 as hcam
 #%% moke_rig class
 class moke_rig:
     """
@@ -216,13 +218,12 @@ def run_experiment_t(rig, t_raw, t_measure):
     return results
 
 #%% camera-based MOKE
-# TBD
 
 class moke_camera_rig:
     '''
     Moke rig using lock-in camera instead of lock-in amplifier to achieve wide-field imaging
     Hard requirements:
-        lockin camera (represented by LiCam class)
+        lockin camera (designed with helicam_c3 class in mind)
         optical delay stage (represented by TL_ds class)
     Optional requirements:
         half wave plates use a k-cube controller.
@@ -230,7 +231,7 @@ class moke_camera_rig:
         chopper
         
     '''
-    def __init__(self, delay_stage, li_camera=None, hwp=None):
+    def __init__(self, delay_stage:TL_ds, li_camera:hcam.HeliCamC3, hwp=None):
         self.licam = li_camera
         self._licamtype = li_camera.type
         self.ds = delay_stage
@@ -250,6 +251,7 @@ class moke_camera_rig:
         '''
         # initialize lock-in camera
         self.licam.initialize()
+        self.HEIGHT, self.WIDTH = self.licam.get_image_shape()
         # initialize delay stage
         self.ds.initialize()
         # initialize all optional hardware
@@ -262,6 +264,7 @@ class moke_camera_rig:
         print("MOKE camera rig initialized.")
 
     def close(self):
+        #NOTE: can i get it to run whenever this object is deleted?
         ''' Close all hardware devices. '''
         # close lock-in camera
         self.licam.close()
@@ -270,6 +273,9 @@ class moke_camera_rig:
         # close optional hardware
         if self.hwp is not None:
             self.hwp.close()
+
+    def __del__(self):
+        self.close()
 
     # ----- parameterize -----
     def set_camera_steady_state(self):
@@ -284,24 +290,18 @@ class moke_camera_rig:
         # NOTE: prefer to directly use the lock-in camera's own methods to set parameters, instead of wrapping them here. This is to avoid confusion and redundancy.
         self.licam.set_attributes(**kwargs)
 
-
     # ----- measurement -----
     def camera_acquire(self):
         return self.licam.acquire()
 
-    def camera_stream_frame(self, timeout=300, interval=0.05, autoscale=True):
+    def camera_stream_frame(self, fig, ax, timeout=300, interval=0.05, autoscale=True):
         ''' Preview the lock-in camera image. Usually used in alignment.
         Time out in seconds. Default is 300 seconds. '''
-        fig, ax = plt.subplots()
-        ax.clear()
 
         frame = self.camera_acquire()          # <- your acquisition call
         im = ax.imshow(frame, cmap='gray', interpolation='nearest')
         plt.figure.colorbar(im, ax=ax)
         title = ax.set_title('t = 0.0 s')
-
-        plt.ion()
-        plt.figure.show()
 
         t0 = next_t = time.monotonic()
         n = 0
@@ -318,7 +318,7 @@ class moke_camera_rig:
                 if autoscale:
                     im.set_clim(frame.min(), frame.max())
                 title.set_text(f't = {elapsed:5.1f} s | frame {n} | '
-                            f'max {frame.max():g}')
+                            f'max {frame.max():g}\nPress any key to exit.')
 
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()
@@ -350,53 +350,105 @@ class moke_camera_rig:
         img = self.camera_acquire_frame(t_acquire)
         return img
 
-    def measure_delta(self, n_pair, t_acquire, method, method_dict):
+    def continuous_measure_frame_at_time(self, t_delay, t_acquire, n_frames):
         """
-        Measure delta signal with n_pair of frames, each frame with t_acquire.
+        Move delay stage to t_delay, acquire n_frames with t_acquire
+        """
+        self.ds.goto_t(t_delay)
+        imgs = np.zeros((n_frames, self.HEIGHT, self.WIDTH))
+        for i in range(n_frames):
+            imgs[i] = self.stream(t_acquire)
+        return imgs
+
+    def measure_delta(self, n_measure, t_acquire, method, method_dict):
+        """
+        Measure delta signal with n_measure of frames, each frame with t_acquire.
         The "method" argument defines how to determine pump / un-pump frames. The "method" argument is supported by a "method_dict" dictionary.
             "even_odd": even frames are pump, odd frames are un-pump, or vice versa. Requires a "pump_first" boolean in method_dict to indicate whether the first frame is pump or un-pump. 
             "reference_roi": use a reference region on camera to determine pump / un-pump frames. Requires 4 keys in method_dict: "x_center", "y_center", "width", "height" to define the reference ROI. 
                 Frames with stronger signal in the reference ROI are considered pump frames, and weaker signal are considered un-pump frames.
         """
         assert method in ["even_odd", "reference_roi"], "method must be either 'even_odd' or 'reference_roi'"
-        pass
+        mats_even = np.zeros((n_measure, self.HEIGHT, self.WIDTH))
+        mat_odd = np.zeros_like(mats_even)
+        for i in range(n_measure):
+            pass
 
-    def measure_delta_at_time(self, t_delay, n_pair, t_acquire, method, method_dict):
+    def measure_delta_at_time(self, t_delay, n_measure, t_acquire, method, method_dict, save_path = None):
         """
-        Move delay stage to t_delay, measure delta signal with n_pair of frames, each frame with t_acquire.
+        Move delay stage to t_delay, measure delta signal with n_measure of frames, each frame with t_acquire.
         See measure_delta() for details on method and method_dict.
         """
         self.ds.goto_t(t_delay)
-        delta = self.measure_delta(n_pair, t_acquire, method, method_dict)
+        delta = self.measure_delta(n_measure, t_acquire, method, method_dict)
         return delta
 
-    def measure_delta_at_time_avg(self, reps, t_delay, n_pair, t_acquire, method, method_dict):
+    def measure_delta_at_time_avg(self, reps, t_delay, n_measure, t_acquire, method, method_dict, save_path = None):
         """
-        Measure delta signal with n_pair of frames, each frame with t_acquire, at t_delay, and repeat for reps times. Average the results.
+        Measure delta signal with n_measure of frames, each frame with t_acquire, at t_delay, and repeat for reps times. Average the results.
         """
         assert reps >= 1, "reps must be positive"
         reps = int(reps)
         size = self.licam.get_image_shape()
         deltas = np.zeros((reps, size[0], size[1]))   # [rep, y, x] indexing
         for i in range(reps):
-            delta = self.measure_delta_at_time(t_delay, n_pair, t_acquire, method, method_dict)
+            delta = self.measure_delta_at_time(t_delay, n_measure, t_acquire, method, method_dict)
             deltas[i] = delta
         delta_avg = np.mean(deltas, axis=0)
         stds = np.std(deltas, axis=0)
         return delta_avg, stds
 
-    def scan_delta(self, t_delay_array, n_pair_array, t_acquire, method, method_dict):
+    def scan_delta(self, t_delay_array, n_measure_array, t_acquire, method, method_dict):
         """
-        Scan delay stage to t_delay_array, measure delta signal with n_pair of frames at each delay, each frame with t_acquire.
+        Scan delay stage to t_delay_array, measure delta signal with n_measure of frames at each delay, each frame with t_acquire.
         See measure_delta() for details on method and method_dict.
         """
         t_delay_array = np.asarray(t_delay_array)
-        n_pair_array = np.asarray(n_pair_array)
-        assert t_delay_array.size == n_pair_array.size, "t_delay_array and n_pair_array must have the same size"
+        n_measure_array = np.asarray(n_measure_array)
+        assert t_delay_array.size == n_measure_array.size, "t_delay_array and n_measure_array must have the same size"
         size = self.licam.get_image_shape()
         deltas = np.zeros((t_delay_array.size, size[0], size[1]))   # [t, y, x] indexing
-        for i, (t_delay, n_pair) in enumerate(zip(t_delay_array, n_pair_array)):
-            delta = self.measure_delta_at_time(t_delay, n_pair, t_acquire, method, method_dict)
+        for i, (t_delay, n_measure) in enumerate(zip(t_delay_array, n_measure_array)):
+            delta = self.measure_delta_at_time(t_delay, n_measure, t_acquire, method, method_dict)
             deltas[i] = delta
         return deltas
+
+    # ----- IO -----
+    def save_frame_txt(self, mat2d, filename):
+        """
+        Save a single frame to file
+        """
+        assert mat2d.ndim == 2, "mat2d must be 2D array"
+        assert os.path.exists(os.path.dirname(filename)), "directory does not exist"
+
+        np.savetxt(filename, mat2d, delimiter=',', fmt='%4g')   # output in 4 sigfig
+
+    def save_frame_np(self, mat2d, filename):
+        """
+        Save a single frame to file as a compressed npy file using np.save.
+        """
+        assert mat2d.ndim == 2, "mat2d must be 2D array"
+        assert os.path.splitext(filename)[1] == ".npy", "filename must have .npy extension"
+        assert os.path.exists(os.path.dirname(filename)), "directory does not exist"
+
+        np.save(filename, mat2d=mat2d)
+
+    def save_all_txt(self, mat3d, filename):
+        """
+        Save a 3D array to file as a continuous 2D matrix.
+        """
+        assert mat3d.ndim == 3, "mat3d must be 3D array"
+        assert os.path.exists(os.path.dirname(filename)), "directory does not exist"
+
+        np.savetxt(filename, mat3d.reshape(mat3d.shape[0], -1), delimiter=',', fmt='%4g')   # output in 4 sigfig
+
+    def save_all_np(self, mat3d, filename):
+        """
+        Save a 3D array to file as a compressed npy file using np.save.
+        """
+        assert mat3d.ndim == 3, "mat3d must be 3D array"
+        assert os.path.splitext(filename)[1] == ".npy", "filename must have .npy extension"
+        assert os.path.exists(os.path.dirname(filename)), "directory does not exist"
+
+        np.save(filename, mat3d=mat3d)
 # %%

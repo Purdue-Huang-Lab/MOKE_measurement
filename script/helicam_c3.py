@@ -558,6 +558,11 @@ class HeliCamC3:
             return None
         return acc / count
 
+    def stream_on_trigger(self, t_acqure: float, n_frames: int):
+        """
+        Stream frames on trigger
+        """
+        pass
 
     def _frame_duration_s(self) -> float:
         """
@@ -667,6 +672,16 @@ class HeliCamC3:
             cam_mode, n_frames, estimate, sensor_s, transfer_s, payload / 1e6,
         )
         return estimate
+
+    # ------------------------------------------------------------------
+    # 5. trigger
+    # ------------------------------------------------------------------
+    def set_internal_trigger(self, f, phase):
+        pass
+
+    def get_trigger_status(self):
+        pass
+        return (f, phase)
 
     # ------------------------------------------------------------------
     # 5. Data processing

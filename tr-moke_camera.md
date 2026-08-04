@@ -14,8 +14,12 @@ Measurement arm: goes through a PEM at 0 degree, an analyzer polarizer at 45 deg
 6. Measure
 ## code workflow
 1. Initialize all devices (licam, delay stage)
-2. Steady state streaming
+2. Steady state streaming for alignment
 3. Calibrate with given HWP angle
-4. Triggering test
-5. Find t0 with manual time scan
-6. Scan
+4. Set up trigger to chopper
+4.2 Alternatively: setup reference signal, define ROI set determine.
+5. Visualize and show pump on/off seperation and trigger timing
+6. Find t0 with manual time scan
+7. Signal optimization
+8. Measure. Save frame during measurement as 2D frames, save 3D dataset after completion.
+9. (on exit) Close all devices, exit.
