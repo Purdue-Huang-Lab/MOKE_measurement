@@ -1,4 +1,4 @@
-from script.helicam_c3 import HeliCamC3 as hcam
+from moke.devices.helicam import HeliCamC3 as hcam
 import numpy as np
 import logging
 import matplotlib.pyplot as plt

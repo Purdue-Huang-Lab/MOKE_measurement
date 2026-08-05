@@ -125,11 +125,8 @@ moke/
   devices/
     base.py       Device ABC: open/close/status, context-manager protocol
     helicam.py    HeliCam    — ctypes binding to heliSDK DLL
-    pem.py        PEM        — amplitude, freq readback, 2f ref
-    chopper.py    Chopper    — MC2000B; set_freq, lock_status
     stage.py      DelayStage — move_ps, wait_settle, limits
     kcube.py      KCube      — probe azimuth HWP, backlash-aware
-    faraday.py    FaradayCoil— DC + AC current source (measure I, don't infer from V)
   acquire.py      RunState machine + run loop
   accumulate.py   Accumulator
   calibrate.py    phase_scan, faraday_calibrate, null_offset, dark_flat_badpix, find_t0
