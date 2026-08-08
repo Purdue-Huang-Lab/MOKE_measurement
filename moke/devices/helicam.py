@@ -10,6 +10,8 @@ import os
 import logging
 import numpy as np
 
+from moke.devices.base import Device
+
 _log = logging.getLogger(__name__)
 
 # SDK message "param" kind, low 8 bits (see Heliotis Python example
@@ -54,7 +56,7 @@ if _wrapper_path not in sys.path:
 from libHeLIC import LibHeLIC   
 
 
-class HeliCamC3:
+class HeliCamC3(Device):
     """
     High-level driver for the Heliotis heliCam C3.
 
@@ -97,7 +99,7 @@ class HeliCamC3:
         "SensNDarkFrames": 7,   # dark frames taken; must be >= 7 and <= SensNFrames - 4
         "SensExpTime":     1,   # short exposure time [µs]; actual = SensExpTime * (SensExpTimeMult+1)
         "SensExpTimeMult": 0,   # exposure time multiplier; actual exposure = SensExpTime * (SensExpTimeMult+1)
-        "SensExpRatio":    3,   # dead time to comply with the frame rate
+        "SensExpRatio":    3,   # short:long exposure ratio (register description §2.12); NOT frame-rate dead time
         "BSEnable":        0,   # must be 0 for intensity mode (manual §5.4)
         "TrigFreeExtN":    1,   # free-running for continuous steady-state capture
         "TrigExtSrcSel":   0,   # always 0 per SDK examples
@@ -131,10 +133,21 @@ class HeliCamC3:
     NOMINAL_FRAME_DURATION_S = 23364 / 35e6   # 667.5 us
 
     # Map from CamMode to the expected CamDataFmt for AllocCamData.
+    #
+    # NOTE on CamMode 3 (intensity): the programmer's manual documents this
+    # mode as using DF_Hf (32-bit float), with the SDK itself doing the
+    # dark-frame subtraction and HDR combination on-device and returning
+    # SensNFrames-SensNDarkFrames-3 reduced frames. This driver instead
+    # requests DF_I16Q16 (raw I/Q) and reimplements that reduction in
+    # to_numpy(). That diverges from the documented path, but STEADY_SETTINGS
+    # above records these exact values as verified end-to-end on real
+    # hardware (serial 1002688069) -- so this is a known doc/code mismatch,
+    # not yet confirmed as a bug. Don't "fix" it to DF_Hf without testing
+    # against real hardware first.
     _MODE_TO_FMT = {
         0: "DF_I16Q16",   # raw IQ
         1: "DF_A16",      # amplitude volume
-        3: "DF_I16Q16",   # intensity (IQ raw used, summed in post)
+        3: "DF_I16Q16",   # intensity (IQ raw used, summed in post) -- see NOTE above
         4: "DF_A16Z16",   # simple max  → surface (Z) + amplitude (A)
         5: "DF_Z16A16P16",# extended simple max → Z, A, phase
         7: "DF_A16Z16",   # minimize energy
@@ -306,6 +319,14 @@ class HeliCamC3:
                 f"{caller}: camera is not open — call open() first"
             )
 
+    def status(self) -> dict:
+        """Return open flag, sys id, and current measurement mode."""
+        return {
+            "open": self._is_open,
+            "sys_id": self._sys_id,
+            "cam_mode": getattr(self, "_current_cammode", None),
+        }
+
     @property
     def is_open(self) -> bool:
         return self._is_open
@@ -319,19 +340,19 @@ class HeliCamC3:
     # 4. Measurement
     # ------------------------------------------------------------------
 
-    def set_roi(self, x0: int, y0: int, width: int, height: int) -> None:
-        # NOTE: check if it is possible.
-        """
-        Set the camera's region of interest (ROI).
-
-        Parameters
-        ----------
-        x0, y0:
-            Top-left corner of the ROI in pixels. Must be within the sensor bounds.
-        width, height:
-            Size of the ROI in pixels. Must be positive and fit within the sensor bounds.
-        """
-        pass
+    # def set_roi(self, x0: int, y0: int, width: int, height: int) -> None:
+    #     # NOTE: check if it is possible.
+    #     """
+    #     Set the camera's region of interest (ROI).
+    #
+    #     Parameters
+    #     ----------
+    #     x0, y0:
+    #         Top-left corner of the ROI in pixels. Must be within the sensor bounds.
+    #     width, height:
+    #         Size of the ROI in pixels. Must be positive and fit within the sensor bounds.
+    #     """
+    #     pass
 
     def set_measurement_mode(self, modedesc, **kwargs):
         """
@@ -558,11 +579,9 @@ class HeliCamC3:
             return None
         return acc / count
 
-    def stream_on_trigger(self, t_acqure: float, n_frames: int):
-        """
-        Stream frames on trigger
-        """
-        pass
+    def stream_on_trigger(self, t_acquire_s: float, n_frames: int):
+        """Not implemented -- stream frames gated on an external trigger."""
+        raise NotImplementedError
 
     def _frame_duration_s(self) -> float:
         """
@@ -676,15 +695,130 @@ class HeliCamC3:
     # ------------------------------------------------------------------
     # 5. trigger
     # ------------------------------------------------------------------
-    def set_internal_trigger(self, f, phase):
-        pass
+    def set_internal_trigger(self, f_hz, phase):
+        """Not implemented -- configure the camera's internal trigger frequency/phase."""
+        raise NotImplementedError
 
     def get_trigger_status(self):
-        pass
-        return (f, phase)
+        """Not implemented -- read back internal trigger frequency/phase."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 5. Data processing
+    # 6. Lock-in acquisition (arm / read_frame / set_demod_clock)
+    # ------------------------------------------------------------------
+    #
+    # Implements the plan doc's (§5.3) per-trigger lock-in interface:
+    #   arm(n_demod, phi_us) -> configure the next accumulation
+    #   read_frame()         -> block for it and return (I, Q)
+    #   set_demod_clock()    -> select the demod clock source
+    #
+    # phi_us and the external demod-clock source both depend on SDK
+    # registers that have not been confirmed against the register
+    # description yet -- see plan doc §6 open item ("confirm heliCam C3
+    # frame-sync/trigger output"). Until that's resolved, phi_us=0 and
+    # set_demod_clock() are documented gaps, not silently-wrong stand-ins.
+
+    def arm(self, n_demod: int, phi_us: float = 0.0) -> None:
+        """
+        Prepare the camera to accumulate one lock-in half-period on the
+        next trigger edge.
+
+        Parameters
+        ----------
+        n_demod:
+            Number of demodulation cycles to accumulate before readout
+            (plan doc §3's N_demod). Must be even -- odd N_demod leaves a
+            residual 1f component instead of cancelling it pairwise (plan
+            doc §3, §5.4 invariant). Maps onto the averaging-cycle
+            register via ``SensNavM2 = (n_demod-2)/2``, valid for
+            n_demod in [4, 512] (even).
+        phi_us:
+            Trigger-to-accumulation start delay, in microseconds (plan
+            doc §3's φ₁/φ₂). Only 0 is currently supported.
+
+        Raises
+        ------
+        ValueError
+            If `n_demod` is odd or maps outside the register's range.
+        NotImplementedError
+            If `phi_us` is nonzero -- no confirmed SDK register exposes a
+            trigger-start delay yet (plan doc §6 open item).
+
+        Notes
+        -----
+        Uses CamMode 0 (raw IQ) so `read_frame()` can return (I, Q)
+        directly, without the surface-mode peak-finding CamMode 4/7 do
+        on-FPGA.
+        """
+        self._require_open("arm")
+        if n_demod % 2 != 0:
+            raise ValueError(f"n_demod must be even (plan doc §3/§5.4), got {n_demod}")
+        sens_nav_m2 = (n_demod - 2) // 2
+        if not (1 <= sens_nav_m2 <= 255):
+            raise ValueError(
+                f"n_demod={n_demod} -> SensNavM2={sens_nav_m2} out of range "
+                f"[1, 255] (valid n_demod: 4-512, even)"
+            )
+        if phi_us != 0.0:
+            raise NotImplementedError(
+                f"phi_us={phi_us} requested but no confirmed SDK register exposes "
+                f"a trigger-start delay yet -- see plan doc §6 open item"
+            )
+
+        self.set_attributes(AcqStop=1)
+        self.set_attributes(CamMode=0, SensNavM2=sens_nav_m2, SensNFrames=1, AcqStop=0)
+        fmt = LibHeLIC.CamDataFmt[self._MODE_TO_FMT[0]]
+        self._lib.AllocCamData(1, fmt, 0, 0, 0)
+        self._current_cammode = 0
+        _log.info("Armed for n_demod=%d (SensNavM2=%d), phi_us=%.1f", n_demod, sens_nav_m2, phi_us)
+
+    def read_frame(self):
+        """
+        Block until the accumulation set up by `arm()` completes and
+        return (I, Q).
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray] or None
+            (I, Q), each int16 (300, 300). None if the acquisition timed
+            out or missed its trigger (see `_acquire()`).
+        """
+        self._require_open("read_frame")
+        data = self._acquire()
+        if data is None:
+            return None
+        iq = data.view(np.int16).reshape(self.SENSOR_HEIGHT, self.SENSOR_WIDTH, 2)
+        return iq[:, :, 0], iq[:, :, 1]
+
+    def set_demod_clock(self, external: bool = True) -> None:
+        """
+        Select the demodulation clock source.
+
+        Parameters
+        ----------
+        external:
+            If True, lock the demod clock to the PEM 2f reference (plan
+            doc §3's mandatory hard lock -- the PEM is resonant and
+            drifts, so free-running against it is not an option for real
+            data).
+
+        Raises
+        ------
+        NotImplementedError
+            Always, for now -- no SDK register for demod-clock source has
+            been confirmed yet (plan doc §6 open item). Do not substitute
+            `TrigFreeExtN` here: that register gates the acquisition
+            *trigger*, not the demodulation clock, and treating them as
+            interchangeable would silently defeat the PEM lock this
+            method exists to guarantee.
+        """
+        raise NotImplementedError(
+            "set_demod_clock: no confirmed SDK register for demod clock source "
+            "-- see plan doc §6 open item"
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Data processing
     # ------------------------------------------------------------------
     def to_numpy(self, data):
         """

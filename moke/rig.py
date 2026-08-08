@@ -96,7 +96,7 @@ class moke_camera_rig:
 
     # ----- measurement -----
     def camera_acquire(self):
-        return self.licam.acquire()
+        return self.licam.acquire_single()
 
     def camera_stream_frame(self, fig, ax, timeout=300, interval=0.05, autoscale=True):
         ''' Preview the lock-in camera image. Usually used in alignment.
