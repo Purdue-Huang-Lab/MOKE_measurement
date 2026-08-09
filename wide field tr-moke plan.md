@@ -1,4 +1,4 @@
-# Wide-Field tr-MOKE — Field Guide & Code Spec
+vs# Wide-Field tr-MOKE — Field Guide & Code Spec
 
 **Rev 3.** PEM polarimetry → heliCam lock-in imaging of pump-induced Kerr rotation on CrSBr.
 §1–4 = bench reference. §5 = software architecture (the part to hand an AI along with the task).

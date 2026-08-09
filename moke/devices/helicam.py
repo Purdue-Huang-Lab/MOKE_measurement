@@ -108,6 +108,11 @@ class HeliCamC3(Device):
 
     RAWIQ_SETTINGS = {
         "CamMode":       0,
+        # Without an explicit default here, switching into rawIQ mode after
+        # "steady" (SensNFrames=385) would silently inherit that leftover
+        # value -- a 385-frame raw IQ volume instead of a small test
+        # acquisition. Override via set_measurement_mode("rawIQ", SensNFrames=...).
+        "SensNFrames":   10,
     }
 
     AMPLITUDE_SETTINGS = {
@@ -119,6 +124,20 @@ class HeliCamC3(Device):
 
     SENSOR_HEIGHT = 300     # helioct3 sensor, per SysDesc.xml (size="300 300")
     SENSOR_WIDTH  = 300
+
+    # ADC output resolution -- manual §8.1/8.2 "Sensor Specification" table
+    # ("Output Resolution | 10 bit", both heliSens S3.0 and S3.1 variants),
+    # corroborated by §5.1: "raw_I and raw_Q values are returned, ranging
+    # 0-1023 (10-bit, unsigned u10.0)". Source is the manual
+    # (heliCamC3_manual_v1_15.md), NOT the register description PDF --
+    # despite an earlier version of this comment saying so.
+    SENSOR_ADC_MAX = 1023
+
+    # DdsGain register code <-> analogue voltage gain (register description
+    # §2.x: 00->3x, 01->1.5x, 10->1x [best SNR], 11->0.75x). Shared by
+    # set_gain() and auto_expose() so the two can't drift apart.
+    ANALOGUE_GAIN_LIST = [3.0, 1.5, 1.0, 0.75]
+    DDS_GAIN_CODES     = [0, 1, 2, 3]
 
     SEQUENCER_CLOCK_HZ = 35e6   # clock FrmDur35MHz / TDemodCyc35MHz are counted in
 
@@ -447,11 +466,9 @@ class HeliCamC3(Device):
         gain:
             Gain value to set for the camera.
         """
-        allowed_gain_list = [3.0, 1.5, 1, 0.75]
-        DdsGain_list = [0, 1, 2, 3]
-        if analogue_gain not in allowed_gain_list:
-            raise ValueError(f"Invalid analogue_gain: {analogue_gain}. Allowed values are {allowed_gain_list}.")
-        DdsGain = DdsGain_list[allowed_gain_list.index(analogue_gain)]
+        if analogue_gain not in self.ANALOGUE_GAIN_LIST:
+            raise ValueError(f"Invalid analogue_gain: {analogue_gain}. Allowed values are {self.ANALOGUE_GAIN_LIST}.")
+        DdsGain = self.DDS_GAIN_CODES[self.ANALOGUE_GAIN_LIST.index(analogue_gain)]
         self.set_attributes(DdsGain=DdsGain)
         _log.info("Set analogue gain to %sx (DdsGain=%d)", analogue_gain, DdsGain)
 
@@ -582,6 +599,171 @@ class HeliCamC3(Device):
     def stream_on_trigger(self, t_acquire_s: float, n_frames: int):
         """Not implemented -- stream frames gated on an external trigger."""
         raise NotImplementedError
+
+    def _intensity_full_scale(self, n_frames: int = None, n_dark: int = None) -> int:
+        """
+        Conservative upper bound on ``to_numpy()``'s CamMode-3 intensity reduction.
+
+        ``to_numpy()`` sums the (dark-baseline-subtracted) I and Q channels
+        of every useful (non-dark) frame: ``useful_frames * 2 channels``,
+        each raw channel capped at the 10-bit ADC ceiling (``SENSOR_ADC_MAX``
+        = 1023, manual §8.1/8.2 "Output Resolution | 10 bit") before
+        subtraction. Since subtracting the (non-negative) dark baseline can
+        only reduce a sample's value, this bound is an upper bound, not
+        necessarily an exactly-reachable ceiling -- it assumes a best-case
+        zero dark baseline. If ``to_numpy()``'s reduction changes, update
+        both together (see the CamMode-3 NOTE on ``_MODE_TO_FMT`` for why
+        it's flagged as an unverified divergence from the vendor-documented
+        path).
+
+        Parameters
+        ----------
+        n_frames, n_dark:
+            Override ``SensNFrames``/``SensNDarkFrames``. Default to the live
+            registers when open, else ``STEADY_SETTINGS``.
+
+        Returns
+        -------
+        int
+            Upper bound on the pixel value ``to_numpy()`` could return for
+            CamMode 3 given the current frame/dark-frame counts.
+        """
+        if n_frames is None:
+            n_frames = (self.get_attribute("SensNFrames") if self._is_open
+                        else self.STEADY_SETTINGS["SensNFrames"])
+        if n_dark is None:
+            n_dark = (self.get_attribute("SensNDarkFrames") if self._is_open
+                      else self.STEADY_SETTINGS["SensNDarkFrames"])
+        useful_frames = max(n_frames - n_dark, 0)
+        return useful_frames * 2 * self.SENSOR_ADC_MAX
+
+    def auto_expose(
+        self,
+        target_fraction: float = 0.5,
+        t_min_us: float = 1.0,
+        t_max_us: float = 16380.0,
+        tol_frac: float = 0.05,
+        max_iter: int = 20,
+    ) -> dict:
+        """
+        Search for the exposure time that puts the intensity-mode signal at
+        ``target_fraction`` of its theoretical full scale.
+
+        Geometric bracket search (double ``t`` from ``t_min_us`` until the
+        observed fraction crosses the target, or ``t_max_us`` is hit), then
+        bisection within the bracket until ``tol_frac`` or ``max_iter``
+        trials are exhausted -- bounded per
+        device_interface_instruction.md §6 ("every blocking call has a
+        bounded timeout").
+
+        Parameters
+        ----------
+        target_fraction:
+            Target ``frame.max() / full_scale`` ratio, e.g. 0.5 for "half max".
+        t_min_us, t_max_us:
+            Search bounds, in microseconds (same range as ``set_acquire_time``).
+        tol_frac:
+            Stop once within this distance of ``target_fraction``.
+        max_iter:
+            Upper bound on the number of trial acquisitions.
+
+        Returns
+        -------
+        dict
+            ``{"t_acquire_us": <best exposure>, "max_frac": <achieved fraction>,
+            "floor_limited": <bool>,
+            "table": [{"t_acquire_us", "analogue_gain", "max_val", "full_scale", "frac"}, ...]}``.
+            ``table`` has one row per trial acquisition, in call order --
+            directly usable as a saved exposure/gain/max-intensity record.
+            ``floor_limited`` is True when the signal was already at or above
+            ``target_fraction`` at ``t_min_us`` *and* still more than
+            ``tol_frac`` over target -- i.e. exposure can't be reduced any
+            further in software and the result is not actually "at target"
+            (see the ``Notes``).
+
+        Raises
+        ------
+        RuntimeError
+            If the camera is not open, or not already in intensity/steady
+            mode -- call ``set_measurement_mode("steady")`` first. No
+            implicit mode switching (matches the rest of this file).
+
+        Notes
+        -----
+        If ``frac`` is still well above ``target_fraction`` at the minimum
+        exposure, that's a real oversaturation condition (too much incident
+        light for this gain), not something a smaller ``t_acquire_us`` can
+        fix -- ``floor_limited=True`` flags this distinctly from a genuine
+        "reached target" result so it isn't mistaken for success.
+        """
+        self._require_open("auto_expose")
+        if getattr(self, "_current_cammode", None) != 3:
+            raise RuntimeError(
+                "auto_expose: camera must be in intensity/steady mode -- "
+                "call set_measurement_mode('steady') first"
+            )
+
+        full_scale = self._intensity_full_scale()
+        dds_gain_code = self.get_attribute("DdsGain")
+        analogue_gain = self.ANALOGUE_GAIN_LIST[self.DDS_GAIN_CODES.index(dds_gain_code)]
+        table = []
+
+        def trial(t_us):
+            t_us = min(max(t_us, t_min_us), t_max_us)
+            self.set_acquire_time(t_us)
+            frame = self.acquire_single()
+            max_val = int(frame.max()) if frame is not None else 0
+            frac = max_val / full_scale
+            table.append({
+                "t_acquire_us": t_us, "analogue_gain": analogue_gain,
+                "max_val": max_val, "full_scale": full_scale, "frac": frac,
+            })
+            return t_us, frac
+
+        t_lo, frac_lo = trial(t_min_us)
+        if frac_lo >= target_fraction:
+            floor_limited = (frac_lo - target_fraction) > tol_frac
+            if floor_limited:
+                _log.warning(
+                    "auto_expose: signal still %.3f of full scale at the minimum "
+                    "exposure t_min_us=%.1f (target %.2f) -- cannot reduce exposure "
+                    "further; lower the gain or incident light",
+                    frac_lo, t_lo, target_fraction,
+                )
+            else:
+                _log.info("auto_expose: already at target at t_min_us=%.1f (frac=%.3f)", t_lo, frac_lo)
+            return {"t_acquire_us": t_lo, "max_frac": frac_lo, "floor_limited": floor_limited, "table": table}
+
+        t_hi, frac_hi = t_lo, frac_lo
+        while frac_hi < target_fraction and t_hi < t_max_us and len(table) < max_iter:
+            t_lo, frac_lo = t_hi, frac_hi
+            t_hi, frac_hi = trial(t_hi * 2)
+
+        if frac_hi < target_fraction:
+            _log.warning(
+                "auto_expose: never reached target_fraction=%.2f even at t_max_us=%.1f "
+                "(best frac=%.3f)", target_fraction, t_max_us, frac_hi,
+            )
+            return {"t_acquire_us": t_hi, "max_frac": frac_hi, "floor_limited": False, "table": table}
+
+        best_t, best_frac = t_hi, frac_hi
+        while len(table) < max_iter:
+            t_mid = (t_lo + t_hi) / 2
+            t_mid, frac_mid = trial(t_mid)
+            if abs(frac_mid - target_fraction) < abs(best_frac - target_fraction):
+                best_t, best_frac = t_mid, frac_mid
+            if abs(frac_mid - target_fraction) <= tol_frac:
+                break
+            if frac_mid < target_fraction:
+                t_lo = t_mid
+            else:
+                t_hi = t_mid
+
+        _log.info(
+            "auto_expose: t_acquire_us=%.1f -> frac=%.3f (target=%.2f, %d trials)",
+            best_t, best_frac, target_fraction, len(table),
+        )
+        return {"t_acquire_us": best_t, "max_frac": best_frac, "floor_limited": False, "table": table}
 
     def _frame_duration_s(self) -> float:
         """
@@ -835,12 +1017,29 @@ class HeliCamC3(Device):
         Returns
         -------
         np.ndarray
-            * **CamMode 3 – intensity**: 2D int32 (300 × 300).  Dark frames are
-              excluded and I/Q channels are summed to yield an HDR intensity image.
-            * **CamMode 0 – raw IQ**: int16 volume (n_frames × 300 × 300 × 2).
-            * **CamMode 1 – amplitude**: uint16 volume as returned by GetCamArr.
-            * **CamMode 4, 7 – surface**: uint16 (H × W × 2); channel 0 = amplitude,
-              channel 1 = Z-height.
+            * **CamMode 3 – intensity**: 2D float64 (300 × 300). The first
+              ``SensNDarkFrames`` frames are averaged into a per-pixel
+              baseline and subtracted from the remaining frames (BSEnable=0
+              in intensity mode means the hardware doesn't do this itself);
+              I/Q channels are then summed to yield a baseline-subtracted
+              HDR intensity image.
+            * **CamMode 0 – raw IQ**: int16 volume (n_frames × 300 × 300 × 2),
+              unscaled raw ADC counts (0-1023 nominal range) — use
+              ``iq_to_amplitude()`` to convert to physical amplitude.
+            * **CamMode 1 – amplitude**: float32 (300 × 300), physical amplitude
+              (register description §5.2.1: u12.4 fixed-point → divide by 16).
+            * **CamMode 4, 7 – surface**: float32 (H × W × 2); channel 0 = amplitude
+              (u12.4 → /16), channel 1 = Z-height (u11.5 → /32), per register
+              description §5.3.1.
+
+        Raises
+        ------
+        NotImplementedError
+            For CamMode 2/5/6 (smoothed amplitude, extended simple max,
+            reserved) — none are reachable via ``set_measurement_mode()``
+            today, and returning their raw fixed-point ints unscaled would be
+            silently wrong rather than merely unimplemented (see
+            device_interface_instruction.md §2).
         """
         cam_mode = getattr(self, '_current_cammode', None)
         if cam_mode is None and self._is_open:
@@ -855,20 +1054,79 @@ class HeliCamC3(Device):
                     n_dark = self.get_attribute('SensNDarkFrames')
                 except Exception:
                     pass
-            useful = arr[n_dark:].astype(np.int32)
-            return useful.sum(axis=0).sum(axis=-1)   # (300, 300) HDR intensity
+            # BSEnable=0 is mandatory in intensity mode (manual §5.4), which
+            # disables the hardware's own bias/offset suppression -- so every
+            # raw I/Q sample below still carries a per-pixel electronic
+            # baseline that has nothing to do with incident light. The first
+            # n_dark frames of the burst exist to measure exactly that
+            # baseline; average them and subtract per-pixel/per-channel
+            # before summing, instead of just discarding them. Confirmed
+            # necessary on real hardware: without this, a 10x reduction in
+            # incident light changed the summed value by <1% (baseline-
+            # dominated), which made auto_expose() chase a signal that
+            # wasn't actually tracking light level.
+            dark_ref = arr[:n_dark].astype(np.float64).mean(axis=0)   # (300, 300, 2)
+            useful = arr[n_dark:].astype(np.float64) - dark_ref[np.newaxis, ...]
+            return useful.sum(axis=0).sum(axis=-1)   # (300, 300) HDR intensity, baseline-subtracted
 
         elif cam_mode == 0:
-            # Raw IQ — return signed volume unchanged.
+            # Raw IQ — return signed volume unchanged, still raw ADC counts.
             return data.view(np.int16)
 
+        elif cam_mode == 1:
+            # Amplitude volume: u12.4 fixed-point (register description §5.2.1).
+            return data.astype(np.float32) / 16.0
+
         elif cam_mode in (4, 7):
-            # Surface modes: uint16 (H, W, 2) — amplitude in [:,:,0], Z in [:,:,1].
-            return data
+            # Surface modes: amplitude u12.4 (/16), Z u11.5 (/32) -- §5.3.1.
+            out = np.empty(data.shape, dtype=np.float32)
+            out[..., 0] = data[..., 0].astype(np.float32) / 16.0
+            out[..., 1] = data[..., 1].astype(np.float32) / 32.0
+            return out
 
         else:
-            # Amplitude volume or unknown mode — return as-is.
-            return data
+            raise NotImplementedError(
+                f"to_numpy(): CamMode {cam_mode} has no documented conversion "
+                f"implemented (only 0, 1, 3, 4, 7 are)"
+            )
+
+    @staticmethod
+    def iq_to_amplitude(I, Q, offset_I: float = 512.0, offset_Q: float = 512.0) -> np.ndarray:
+        """
+        Convert raw I/Q samples into a lock-in amplitude image.
+
+        Implements the manual's raw-IQ formula (§5.1)::
+
+            I' = raw_I - offset_I
+            Q' = raw_Q - offset_Q
+            Amplitude = sqrt(I'^2 + Q'^2)
+
+        Parameters
+        ----------
+        I, Q:
+            Raw in-phase/quadrature arrays (e.g. from ``read_frame()`` or a
+            slice of a CamMode-0 ``to_numpy()`` volume).
+        offset_I, offset_Q:
+            Per-channel DC offset to subtract before combining. Default to
+            512 -- the manual's documented nominal ADC center for a
+            non-modulated signal ("a non-modulated signal corresponds to a
+            value around 512, not 0"). Pass the real per-pixel values once a
+            calibration routine (``null_offset()``, not yet built) supplies
+            them.
+
+        Returns
+        -------
+        np.ndarray
+            Amplitude, same shape as ``I``/``Q``, float64.
+
+        Notes
+        -----
+        Pure numpy -- no device state, no hardware call. Does not know or
+        care which CamMode produced ``I``/``Q``.
+        """
+        Ic = I.astype(np.float64) - offset_I
+        Qc = Q.astype(np.float64) - offset_Q
+        return np.sqrt(Ic**2 + Qc**2)
 
 if __name__ == "__main__":
     print("This module is intended to be imported, not run directly.")
