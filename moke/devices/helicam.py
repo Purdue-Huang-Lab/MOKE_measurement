@@ -712,7 +712,7 @@ class HeliCamC3(Device):
             t_us = min(max(t_us, t_min_us), t_max_us)
             self.set_acquire_time(t_us)
             frame = self.acquire_single()
-            max_val = int(frame.max()) if frame is not None else 0
+            max_val = np.percentile(frame, 90) if frame is not None else 0
             frac = max_val / full_scale
             table.append({
                 "t_acquire_us": t_us, "analogue_gain": analogue_gain,
