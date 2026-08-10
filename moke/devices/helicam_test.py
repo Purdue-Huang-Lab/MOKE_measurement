@@ -1,20 +1,28 @@
 """
 HeliCam C3 hardware test script -- run manually against real hardware.
 
-Three modes, one bench checkout item each. Each run creates a fresh
+Six modes, one bench checkout item each. Each run creates a fresh
 ``helicam_test_data/helicam_test_NNN/`` folder (auto-incrementing) so
-repeated runs never clobber each other's data.
+repeated runs never clobber each other's data. Regardless of mode, every
+run finishes by dumping the full live register set to ``registers.json``
+(see ``HeliCamC3.dump_registers()``) -- a cheap, always-useful record of
+exactly what state the camera was left in. Modes 2/3/4 additionally dump
+registers immediately before and after each ``auto_expose()`` call, to
+catch what that search itself changes.
 
 Usage::
 
     python -m moke.devices.helicam_test --mode 1
     python -m moke.devices.helicam_test --mode 2
     python -m moke.devices.helicam_test --mode 3
+    python -m moke.devices.helicam_test --mode 4
+    python -m moke.devices.helicam_test --mode 5
+    python -m moke.devices.helicam_test --mode 6
 
-Mode 1 -- lifecycle / exposure & gain characterization:
-    open -> steady mode -> acquire one frame at a default exposure -> save it
-    -> auto_expose() to ~half max -> repeat across analogue gains, recording
-    a (t_acquire_us, gain, max_val, frac) table.
+Mode 1 -- lifecycle / exposure characterization:
+    open -> steady mode -> gain=1x (best SNR, DdsGain=2) -> acquire across a
+    fixed, log-spaced list of exposures, recording a (t_acquire_us, max_val)
+    table. Does NOT use auto_expose() -- see open_issue_helicam.md #9.
 
 Mode 2 -- lock-in detection:
     open -> steady mode -> auto_expose() -> steady frame -> rawIQ mode ->
@@ -26,6 +34,34 @@ Mode 3 -- streaming:
     10 fps (throttled to the camera's own estimated acquire time if slower)
     with Pause / Start / Save frame / Move on buttons -> switch to minE mode
     -> stream again.
+
+Mode 4 -- auto_expose() checkout:
+    open -> steady mode -> gain=1x (DdsGain=2) -> auto_expose() -> record
+    the full search trial table + final frame. Exists to exercise/verify
+    auto_expose() on real hardware in isolation rather than buried inside
+    modes 2/3. auto_expose() detects saturation via the channel0/channel1
+    ratio (see helicamC3_practical_knowledge_base.md #3), not an absolute
+    intensity threshold -- see its docstring in helicam.py.
+
+Mode 5 -- SensNFrames sweep:
+    open -> steady mode -> gain=1x (DdsGain=2) -> t_acquire_us=1.0 (the
+    exposure auto_expose()'s first trial used in mode 4) -> sweep
+    SensNFrames geometrically 32 -> 256, one acquisition each -> record
+    peak intensity. data_reformat() averages (not sums) over frames for
+    CamMode 3 (see its CamMode-3 branch), so max_val should come out flat
+    across this sweep -- this mode is the hardware check for that.
+
+Mode 6 -- SensExpRatio sweep:
+    open -> steady mode -> gain=1x (DdsGain=2) -> fixed short exposure ->
+    sweep SensExpRatio over all 4 values (1:2, 1:4, 1:8, 1:16 short:long,
+    manual §5.4) -> save the raw (pre-data_reformat()) I/Q pair for each via
+    cam.save_raw_np(), and compare channel 0 vs channel 1 magnitude. In
+    CamMode 3, channels I/Q are NOT lock-in components (manual §5.4: "not
+    demodulated signals ... generated on the two channels I and Q") -- they
+    are the short- and long-exposure images of the same HDR pair, so this
+    checks which channel is which and how strongly SensExpRatio separates
+    them (channel 0 was eyeballed ~10x stronger than channel 1 in an
+    earlier capture, at whatever SensExpRatio that run happened to use).
 
 This script owns all visualization/GUI/file-IO weight -- ``helicam.py``
 stays a plain (non-GUI) device driver; see device_interface_instruction.md.
@@ -54,7 +90,20 @@ logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, datefmt=_LOG_DATEFMT
 _log = logging.getLogger(__name__)
 
 DEFAULT_T_ACQUIRE_US = 10.0
-DEFAULT_GAINS = (3.0, 1.5, 1.0, 0.75)
+# Fixed log-spaced exposure sweep for mode 1 (1us, then 2..64us doubling) --
+# see mode1_lifecycle() for why this replaced an auto_expose()-driven search.
+DEFAULT_MODE1_T_ACQUIRE_US_LIST = (1.0,) + tuple(round(t) for t in np.geomspace(2.0, 64.0, num=6))
+
+# Mode 5: geometric SensNFrames sweep, 32 -> 64 -> 128 -> 256 (doubling each
+# step), at the fixed 1us exposure auto_expose()'s first trial used in mode 4.
+DEFAULT_MODE5_SENSNFRAMES_LIST = tuple(int(round(n)) for n in np.geomspace(32, 256, num=10))
+DEFAULT_MODE5_T_ACQUIRE_US = 1.0
+
+# Mode 6: all 4 SensExpRatio settings (register description §2.13:
+# 0=1:2, 1=1:4, 2=1:8, 3=1:16 short:long), at the same fixed 1us short
+# exposure mode 5 used.
+DEFAULT_MODE6_SENSEXPRATIO_LIST = (0, 1, 2, 3)
+DEFAULT_MODE6_T_ACQUIRE_US = 1.0
 
 
 def _timed(label: str, fn, *args, level: int = logging.INFO, **kwargs):
@@ -146,41 +195,42 @@ def amplitude_channel(frame: np.ndarray) -> np.ndarray:
 # Mode 1 -- lifecycle, parameters, exposure/gain characterization
 # ----------------------------------------------------------------------
 
-def mode1_lifecycle(cam: HeliCamC3, out_dir: str, t_acquire_us: float, gains) -> None:
+def mode1_lifecycle(cam: HeliCamC3, out_dir: str, t_acquire_us_list) -> None:
+    """
+    Fixed gain=1x (best SNR, DdsGain=2), fixed log-spaced exposure sweep --
+    no auto_expose(). auto_expose() has two known bugs (see
+    open_issue_helicam.md #9: its "never reached target" fallback returns
+    the last, failed trial instead of the best real one, and nothing
+    resyncs the acquisition pipeline after a timeout, so one bad trial can
+    wedge every trial after it) that made a real bench run come back with
+    every "optimal frame" as None. Bypass it entirely until those are fixed.
+    """
     _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
-
-    _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
-    frame = _timed("acquire_single() [initial]", cam.acquire_single)
-    if frame is None:
-        raise RuntimeError("mode1: initial acquire_single() returned no data")
-    save_frame(out_dir, "mode1_initial_frame", frame)
-    _log.info("Mode 1: initial frame at t_acquire_us=%.1f -> max=%s", t_acquire_us, frame.max())
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
 
     rows = []
-    gain_frames = {}
-    for gain in gains:
-        _timed(f"set_gain({gain})", cam.set_gain, gain)
-        result = _timed(f"auto_expose() [gain={gain}]", cam.auto_expose, target_fraction=0.5)
-        rows.extend(result["table"])
-        if result["floor_limited"]:
-            _log.warning("Mode 1: gain=%s -> still oversaturated (frac=%.3f) at the minimum "
-                         "exposure -- target not actually reached", gain, result["max_frac"])
-        _log.info("Mode 1: gain=%s -> optimal t_acquire_us=%.1f (max_frac=%.3f, %d trials)",
-                   gain, result["t_acquire_us"], result["max_frac"], len(result["table"]))
-        frame = _timed(f"acquire_single() [gain={gain} optimal]", cam.acquire_single)
-        save_frame(out_dir, f"mode1_gain_{gain}_optimal_frame", frame)
-        gain_frames[gain] = frame
+    frames = {}
+    for t_us in t_acquire_us_list:
+        _timed(f"set_acquire_time({t_us})", cam.set_acquire_time, t_us)
+        frame = _timed(f"acquire_single() [t={t_us:g}us]", cam.acquire_single)
+        save_frame(out_dir, f"mode1_t{t_us:g}us_frame", frame)
+        frames[t_us] = frame
+        max_val = float(frame.max()) if frame is not None else None
+        rows.append({"t_acquire_us": t_us, "analogue_gain": 1.0, "max_val": max_val})
+        _log.info("Mode 1: t_acquire_us=%.1f -> max=%s", t_us, max_val)
 
-    save_table(out_dir, "mode1_exposure_gain_table", rows)
+    save_table(out_dir, "mode1_exposure_table", rows)
 
-    fig, axes = plt.subplots(1, len(gains), figsize=(4 * len(gains), 4))
-    if len(gains) == 1:
+    fig, axes = plt.subplots(1, len(t_acquire_us_list), figsize=(4 * len(t_acquire_us_list), 4))
+    if len(t_acquire_us_list) == 1:
         axes = [axes]
-    for ax, gain in zip(axes, gains):
-        im = ax.imshow(gain_frames[gain], cmap="gray")
-        ax.set_title(f"gain={gain}")
-        fig.colorbar(im, ax=ax)
-    fig.suptitle("Mode 1: optimal-exposure frame per gain")
+    for ax, t_us in zip(axes, t_acquire_us_list):
+        frame = frames[t_us]
+        if frame is not None:
+            im = ax.imshow(frame, cmap="gray")
+            fig.colorbar(im, ax=ax)
+        ax.set_title(f"t={t_us:g}us")
+    fig.suptitle("Mode 1: exposure sweep (gain=1x)")
     fig.savefig(os.path.join(out_dir, "mode1_summary.png"))
     plt.show()
 
@@ -192,9 +242,11 @@ def mode1_lifecycle(cam: HeliCamC3, out_dir: str, t_acquire_us: float, gains) ->
 def mode2_lockin(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
     _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
     _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+    cam.dump_registers(out_dir, "mode2_registers_before_autoexpose")
     result = _timed("auto_expose()", cam.auto_expose, target_fraction=0.5)
-    _log.info("Mode 2: auto_expose -> t_acquire_us=%.1f (max_frac=%.3f)",
-               result["t_acquire_us"], result["max_frac"])
+    cam.dump_registers(out_dir, "mode2_registers_after_autoexpose")
+    _log.info("Mode 2: auto_expose -> t_acquire_us=%.1f (saturation onset=%s us)",
+               result["t_acquire_us"], result["t_saturation_onset_us"])
 
     steady_frame = _timed("acquire_single() [steady]", cam.acquire_single)
     save_frame(out_dir, "mode2_steady_frame", steady_frame)
@@ -218,7 +270,8 @@ def mode2_lockin(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
 
     save_json(out_dir, "mode2_params", {
         "t_acquire_us": result["t_acquire_us"],
-        "steady_max_frac": result["max_frac"],
+        "t_saturation_onset_us": result["t_saturation_onset_us"],
+        "nominal_ratio": result["nominal_ratio"],
         "gain_DdsGain": cam.get_attribute("DdsGain"),
     })
 
@@ -327,9 +380,11 @@ def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
 def mode3_streaming(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
     _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
     _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+    cam.dump_registers(out_dir, "mode3_registers_before_autoexpose")
     result = _timed("auto_expose()", cam.auto_expose, target_fraction=0.5)
-    _log.info("Mode 3: auto_expose -> t_acquire_us=%.1f (max_frac=%.3f)",
-               result["t_acquire_us"], result["max_frac"])
+    cam.dump_registers(out_dir, "mode3_registers_after_autoexpose")
+    _log.info("Mode 3: auto_expose -> t_acquire_us=%.1f (saturation onset=%s us)",
+               result["t_acquire_us"], result["t_saturation_onset_us"])
 
     stream(cam, out_dir, "steady", fps=10.0)
 
@@ -338,18 +393,228 @@ def mode3_streaming(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
 
 
 # ----------------------------------------------------------------------
+# Mode 4 -- auto_expose() checkout in steady mode
+# ----------------------------------------------------------------------
+
+def mode4_autoexpose(cam: HeliCamC3, out_dir: str, target_fraction: float) -> None:
+    """
+    Fixed gain=1x (best SNR, DdsGain=2) -> auto_expose() -> record its full
+    search trial table plus the final frame at the exposure it settled on.
+
+    Isolated from modes 2/3 (which also call auto_expose() but bury its
+    result inside a larger pipeline) so its search behaviour can be checked
+    against real hardware on its own. auto_expose() detects saturation via
+    the channel0/channel1 ratio (see
+    helicamC3_practical_knowledge_base.md #3) instead of an absolute
+    intensity threshold -- this mode's plot shows that ratio holding near
+    SensExpRatio's nominal value, then dropping once channel 0 (long
+    exposure) starts clipping.
+    """
+    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+
+    cam.dump_registers(out_dir, "mode4_registers_before_autoexpose")
+    result = _timed("auto_expose()", cam.auto_expose, target_fraction=target_fraction)
+    cam.dump_registers(out_dir, "mode4_registers_after_autoexpose")
+    _log.info(
+        "Mode 4: auto_expose -> t_acquire_us=%.1f, t_saturation_onset_us=%s, "
+        "floor_limited=%s, ceiling_not_found=%s, %d trial(s)",
+        result["t_acquire_us"], result["t_saturation_onset_us"],
+        result["floor_limited"], result["ceiling_not_found"], len(result["table"]),
+    )
+
+    save_table(out_dir, "mode4_autoexpose_table", result["table"])
+    save_json(out_dir, "mode4_autoexpose_result", {
+        "target_fraction": target_fraction,
+        "t_acquire_us": result["t_acquire_us"],
+        "t_saturation_onset_us": result["t_saturation_onset_us"],
+        "nominal_ratio": result["nominal_ratio"],
+        "floor_limited": result["floor_limited"],
+        "ceiling_not_found": result["ceiling_not_found"],
+        "n_trials": len(result["table"]),
+        "gain_DdsGain": cam.get_attribute("DdsGain"),
+    })
+
+    frame = _timed("acquire_single() [final, post auto_expose]", cam.acquire_single)
+    save_frame(out_dir, "mode4_final_frame", frame)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    trials = [row for row in result["table"] if row["ratio"] is not None]
+    axes[0].plot([row["t_acquire_us"] for row in trials], [row["ratio"] for row in trials], "o-")
+    axes[0].axhline(result["nominal_ratio"], color="gray", linestyle="--", label="nominal ratio")
+    if result["t_saturation_onset_us"] is not None:
+        axes[0].axvline(result["t_saturation_onset_us"], color="red", linestyle=":", label="saturation onset")
+    axes[0].axvline(result["t_acquire_us"], color="green", linestyle=":", label="chosen t_acquire_us")
+    axes[0].set_xscale("log")
+    axes[0].set_xlabel("t_acquire_us")
+    axes[0].set_ylabel("channel0 / channel1 ratio")
+    axes[0].set_title("auto_expose() search trials")
+    axes[0].legend()
+    if frame is not None:
+        im = axes[1].imshow(frame, cmap="gray")
+        fig.colorbar(im, ax=axes[1])
+    axes[1].set_title(f"final frame, t={result['t_acquire_us']:.1f}us")
+    fig.suptitle("Mode 4: auto_expose() checkout")
+    fig.savefig(os.path.join(out_dir, "mode4_summary.png"))
+    plt.show()
+
+
+# ----------------------------------------------------------------------
+# Mode 5 -- SensNFrames sweep (does peak intensity scale with frame count?)
+# ----------------------------------------------------------------------
+
+def mode5_frames_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float, sensnframes_list) -> None:
+    """
+    Fixed gain=1x (DdsGain=2) and exposure -> sweep SensNFrames geometrically
+    -> record peak intensity for each.
+
+    ``to_numpy()`` averages (not sums) over frames for CamMode 3, so
+    ``max_val`` should come out flat across this sweep -- this mode exists
+    to check that on real hardware.
+
+    ``set_measurement_mode("steady", SensNFrames=n)`` is used (not a bare
+    ``set_attributes``) so AllocCamData's buffer is resized to match each N --
+    a stale buffer size for a changed SensNFrames is a real vendor-wrapper
+    footgun here, not a hypothetical one.
+    """
+    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+
+    full_scale = 2 * HeliCamC3.SENSOR_ADC_MAX
+    rows = []
+    frames = {}
+    for n_frames in sensnframes_list:
+        _timed(f"set_measurement_mode('steady', SensNFrames={n_frames})",
+               cam.set_measurement_mode, "steady", SensNFrames=n_frames)
+        _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+        frame = _timed(f"acquire_single() [SensNFrames={n_frames}]", cam.acquire_single)
+        save_frame(out_dir, f"mode5_n{n_frames}_frame", frame)
+        frames[n_frames] = frame
+
+        max_val = float(np.percentile(frame, 99.99)) if frame is not None else None
+        rows.append({
+            "sens_n_frames": n_frames,
+            "t_acquire_us": t_acquire_us,
+            "max_val": max_val,
+            "full_scale": full_scale,
+            "frac": (max_val / full_scale) if max_val is not None else None,
+        })
+        _log.info("Mode 5: SensNFrames=%d -> max_val=%s", n_frames, max_val)
+
+    save_table(out_dir, "mode5_frames_sweep_table", rows)
+
+    fig1, axes1 = plt.subplots(1, len(sensnframes_list), figsize=(4 * len(sensnframes_list), 4))
+    if len(sensnframes_list) == 1:
+        axes1 = [axes1]
+    for ax, n_frames in zip(axes1, sensnframes_list):
+        frame = frames[n_frames]
+        if frame is not None:
+            im = ax.imshow(frame, cmap="gray")
+            fig1.colorbar(im, ax=ax)
+        ax.set_title(f"N={n_frames}")
+    fig1.suptitle(f"Mode 5: SensNFrames sweep (gain=1x, t={t_acquire_us:g}us)")
+    fig1.savefig(os.path.join(out_dir, "mode5_frames_summary.png"))
+
+    ns = [row["sens_n_frames"] for row in rows]
+    peaks = [row["max_val"] for row in rows]
+
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.plot(ns, peaks, "o-")
+    ax2.set_xscale("log")
+    ax2.set_xlabel("SensNFrames")
+    ax2.set_ylabel("peak intensity (99.99th pct)")
+    ax2.set_title("Mode 5: peak intensity vs SensNFrames (expect flat)")
+    fig2.savefig(os.path.join(out_dir, "mode5_peak_intensity.png"))
+    plt.show()
+
+
+# ----------------------------------------------------------------------
+# Mode 6 -- SensExpRatio sweep (channel 0 vs channel 1 magnitude)
+# ----------------------------------------------------------------------
+
+def mode6_sensexpratio_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float, ratio_list) -> None:
+    """
+    Fixed gain=1x (DdsGain=2) and short exposure -> sweep SensExpRatio over
+    all 4 values -> save the raw (pre-data_reformat()) I/Q pair for each and
+    compare channel 0 vs channel 1 magnitude.
+
+    Uses cam.save_raw_np() (not acquire_single()) because data_reformat()
+    sums the two channels together for CamMode 3 -- exactly the distinction
+    this sweep needs to keep separate. Dark-subtracts the same way
+    data_reformat() does (first SensNDarkFrames averaged as baseline,
+    subtracted from the rest) before comparing channel magnitudes.
+    """
+    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+    n_dark = cam.STEADY_SETTINGS["SensNDarkFrames"]
+    ratio_labels = {0: "1:2", 1: "1:4", 2: "1:8", 3: "1:16"}
+
+    rows = []
+    channel_images = {}   # ratio -> (300, 300, 2) dark-subtracted, frame-averaged
+    for ratio in ratio_list:
+        _timed(f"set_measurement_mode('steady', SensExpRatio={ratio})",
+               cam.set_measurement_mode, "steady", SensExpRatio=ratio)
+        _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+        path = _timed(f"save_raw_np() [SensExpRatio={ratio}]",
+                       cam.save_raw_np, out_dir, f"mode6_ratio{ratio}_raw")
+        if path is None:
+            _log.warning("Mode 6: SensExpRatio=%d acquire failed, skipping", ratio)
+            continue
+
+        with np.load(path) as npz:
+            arr = npz["data"].view(np.int16).astype(np.float64)   # (n_frames, 300, 300, 2)
+        dark_ref = arr[:n_dark].mean(axis=0)
+        useful = (arr[n_dark:] - dark_ref[np.newaxis, ...]).mean(axis=0)   # (300, 300, 2)
+        channel_images[ratio] = useful
+
+        ch0_mean, ch1_mean = float(useful[..., 0].mean()), float(useful[..., 1].mean())
+        rows.append({
+            "sens_exp_ratio": ratio,
+            "short_long_ratio": ratio_labels[ratio],
+            "t_acquire_us": t_acquire_us,
+            "channel0_mean": ch0_mean,
+            "channel1_mean": ch1_mean,
+            "channel0_over_channel1": (ch0_mean / ch1_mean) if ch1_mean else None,
+        })
+        _log.info("Mode 6: SensExpRatio=%d (%s) -> channel0=%.2f, channel1=%.2f",
+                   ratio, ratio_labels[ratio], ch0_mean, ch1_mean)
+
+    save_table(out_dir, "mode6_sensexpratio_table", rows)
+
+    fig, axes = plt.subplots(2, len(ratio_list), figsize=(4 * len(ratio_list), 8))
+    if len(ratio_list) == 1:
+        axes = axes.reshape(2, 1)
+    for col, ratio in enumerate(ratio_list):
+        img = channel_images.get(ratio)
+        if img is None:
+            continue
+        im0 = axes[0, col].imshow(img[..., 0], cmap="gray")
+        fig.colorbar(im0, ax=axes[0, col])
+        axes[0, col].set_title(f"SensExpRatio={ratio} ({ratio_labels[ratio]}) ch0")
+        im1 = axes[1, col].imshow(img[..., 1], cmap="gray")
+        fig.colorbar(im1, ax=axes[1, col])
+        axes[1, col].set_title(f"SensExpRatio={ratio} ({ratio_labels[ratio]}) ch1")
+    fig.suptitle(f"Mode 6: SensExpRatio sweep, t={t_acquire_us:g}us (dark-subtracted, frame-averaged)")
+    fig.savefig(os.path.join(out_dir, "mode6_summary.png"))
+    plt.show()
+
+
+# ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", type=int, choices=[1, 2, 3], required=True,
-                         help="1=lifecycle/exposure-gain, 2=lock-in detection, 3=streaming")
+    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6], required=True,
+                         help="1=lifecycle/exposure-gain, 2=lock-in detection, 3=streaming, "
+                              "4=auto_expose() checkout, 5=SensNFrames sweep, "
+                              "6=SensExpRatio sweep")
     parser.add_argument("--sys-id", type=str, default="c3cam_sl70")
     parser.add_argument("--t-acquire-us", type=float, default=DEFAULT_T_ACQUIRE_US,
-                         help="Starting exposure time in microseconds (default: %(default)s)")
-    parser.add_argument("--gains", type=float, nargs="+", default=list(DEFAULT_GAINS),
-                         help="Analogue gains to sweep in mode 1 (default: %(default)s)")
+                         help="Starting exposure time in microseconds, modes 2/3 (default: %(default)s)")
+    parser.add_argument("--target-fraction", type=float, default=0.5,
+                         help="auto_expose() target fraction of the way to the detected "
+                              "saturation onset, mode 4 (default: %(default)s)")
     args = parser.parse_args()
 
     out_dir = make_test_dir()
@@ -358,11 +623,19 @@ def main():
     with HeliCamC3(args.sys_id) as cam:
         _log.info("Camera opened: %s", cam.status())
         if args.mode == 1:
-            mode1_lifecycle(cam, out_dir, args.t_acquire_us, args.gains)
+            mode1_lifecycle(cam, out_dir, DEFAULT_MODE1_T_ACQUIRE_US_LIST)
         elif args.mode == 2:
             mode2_lockin(cam, out_dir, args.t_acquire_us)
         elif args.mode == 3:
             mode3_streaming(cam, out_dir, args.t_acquire_us)
+        elif args.mode == 4:
+            mode4_autoexpose(cam, out_dir, args.target_fraction)
+        elif args.mode == 5:
+            mode5_frames_sweep(cam, out_dir, DEFAULT_MODE5_T_ACQUIRE_US, DEFAULT_MODE5_SENSNFRAMES_LIST)
+        elif args.mode == 6:
+            mode6_sensexpratio_sweep(cam, out_dir, DEFAULT_MODE6_T_ACQUIRE_US, DEFAULT_MODE6_SENSEXPRATIO_LIST)
+
+        cam.dump_registers(out_dir)
 
     _log.info("Done. Output in %s", out_dir)
 

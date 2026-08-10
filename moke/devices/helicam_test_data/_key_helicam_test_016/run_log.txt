@@ -1,0 +1,13 @@
+00:38:28.615 INFO:__main__:Logging to C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_016\run_log.txt
+00:38:30.897 INFO:moke.devices.helicam:Camera 'c3cam_sl70' opened (handle=0x1e5454f1bf0, res=1)
+00:38:30.897 INFO:__main__:Camera opened: {'open': True, 'sys_id': 'c3cam_sl70', 'cam_mode': None}
+00:38:30.906 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+00:38:30.916 INFO:__main__:[   15.0 ms] set_measurement_mode('steady')
+00:38:30.922 INFO:moke.devices.helicam:Set analogue gain to 1.0x (DdsGain=2)
+00:38:30.924 INFO:__main__:[   16.0 ms] set_gain(1.0)
+00:38:30.931 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+00:38:30.931 INFO:__main__:[    0.0 ms] set_measurement_mode('steady', SensNFrames=32)
+00:38:30.940 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+00:38:30.940 INFO:__main__:[   15.0 ms] set_acquire_time(1.0)
+00:38:31.557 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+00:43:22.772 INFO:moke.devices.helicam:Camera closed (res=0)

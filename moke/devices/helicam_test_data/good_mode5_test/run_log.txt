@@ -1,0 +1,81 @@
+01:36:09.746 INFO:__main__:Logging to C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_019\run_log.txt
+01:36:12.057 INFO:moke.devices.helicam:Camera 'c3cam_sl70' opened (handle=0x27fb8bf1bf0, res=1)
+01:36:12.057 INFO:__main__:Camera opened: {'open': True, 'sys_id': 'c3cam_sl70', 'cam_mode': None}
+01:36:12.070 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:12.071 INFO:__main__:[   15.0 ms] set_measurement_mode('steady')
+01:36:12.071 INFO:moke.devices.helicam:Set analogue gain to 1.0x (DdsGain=2)
+01:36:12.071 INFO:__main__:[    0.0 ms] set_gain(1.0)
+01:36:12.080 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:12.080 INFO:__main__:[   16.0 ms] set_measurement_mode('steady', SensNFrames=32)
+01:36:12.087 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:12.087 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:12.740 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:13.093 INFO:__main__:[ 1016.0 ms] acquire_single() [SensNFrames=32]
+01:36:13.093 INFO:__main__:Mode 5: SensNFrames=32 -> max_val=81.81718799999557
+01:36:13.109 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:13.109 INFO:__main__:[   15.0 ms] set_measurement_mode('steady', SensNFrames=40)
+01:36:13.109 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:13.109 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:14.300 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:14.740 INFO:__main__:[ 1625.0 ms] acquire_single() [SensNFrames=40]
+01:36:14.742 INFO:__main__:Mode 5: SensNFrames=40 -> max_val=81.48918181818135
+01:36:14.756 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:14.756 INFO:__main__:[   16.0 ms] set_measurement_mode('steady', SensNFrames=51)
+01:36:14.756 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:14.756 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:16.379 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:16.990 INFO:__main__:[ 2234.0 ms] acquire_single() [SensNFrames=51]
+01:36:16.990 INFO:__main__:Mode 5: SensNFrames=51 -> max_val=81.32797012986556
+01:36:17.006 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:17.007 INFO:__main__:[   16.0 ms] set_measurement_mode('steady', SensNFrames=64)
+01:36:17.009 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:17.009 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:18.951 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:19.647 INFO:__main__:[ 2641.0 ms] acquire_single() [SensNFrames=64]
+01:36:19.647 INFO:__main__:Mode 5: SensNFrames=64 -> max_val=81.38350375939422
+01:36:19.661 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:19.661 INFO:__main__:[   15.0 ms] set_measurement_mode('steady', SensNFrames=81)
+01:36:19.664 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:19.664 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:22.132 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:22.989 INFO:__main__:[ 3328.0 ms] acquire_single() [SensNFrames=81]
+01:36:22.991 INFO:__main__:Mode 5: SensNFrames=81 -> max_val=82.50776100385724
+01:36:23.006 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:23.006 INFO:__main__:[   16.0 ms] set_measurement_mode('steady', SensNFrames=102)
+01:36:23.009 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:23.009 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:26.127 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:27.268 INFO:__main__:[ 4266.0 ms] acquire_single() [SensNFrames=102]
+01:36:27.268 INFO:__main__:Mode 5: SensNFrames=102 -> max_val=82.21353443609024
+01:36:27.288 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:27.288 INFO:__main__:[   15.0 ms] set_measurement_mode('steady', SensNFrames=128)
+01:36:27.288 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:27.288 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:31.402 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:32.754 INFO:__main__:[ 5469.0 ms] acquire_single() [SensNFrames=128]
+01:36:32.761 INFO:__main__:Mode 5: SensNFrames=128 -> max_val=81.98473305784341
+01:36:32.779 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:32.780 INFO:__main__:[   15.0 ms] set_measurement_mode('steady', SensNFrames=161)
+01:36:32.782 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:32.782 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:37.808 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:39.710 INFO:__main__:[ 6922.0 ms] acquire_single() [SensNFrames=161]
+01:36:39.710 INFO:__main__:Mode 5: SensNFrames=161 -> max_val=81.75327532467269
+01:36:39.730 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:39.730 INFO:__main__:[   31.0 ms] set_measurement_mode('steady', SensNFrames=203)
+01:36:39.742 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:39.742 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:46.206 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:48.385 INFO:__main__:[ 8641.0 ms] acquire_single() [SensNFrames=203]
+01:36:48.386 INFO:__main__:Mode 5: SensNFrames=203 -> max_val=81.66843214285083
+01:36:48.403 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+01:36:48.403 INFO:__main__:[   15.0 ms] set_measurement_mode('steady', SensNFrames=256)
+01:36:48.403 INFO:moke.devices.helicam:Set exposure: SensExpTime=1 µs × (SensExpTimeMult=0+1) = 1.0 µs actual
+01:36:48.403 INFO:__main__:[    0.0 ms] set_acquire_time(1.0)
+01:36:56.168 INFO:moke.devices.helicam:Flushed 3 stale frame(s) from USB buffer
+01:36:58.987 INFO:__main__:[10578.0 ms] acquire_single() [SensNFrames=256]
+01:36:58.997 INFO:__main__:Mode 5: SensNFrames=256 -> max_val=82.32589632816766
+01:36:58.997 INFO:__main__:Wrote C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_019\mode5_frames_sweep_table.csv (10 rows)
+01:37:14.999 INFO:moke.devices.helicam:Wrote C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_019\registers.json (79 registers)
+01:37:15.012 INFO:moke.devices.helicam:Camera closed (res=0)
+01:37:15.012 INFO:__main__:Done. Output in C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_019

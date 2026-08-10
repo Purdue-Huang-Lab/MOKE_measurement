@@ -88,3 +88,54 @@ These `raise NotImplementedError` and are not wired to any hardware call:
   `HeliCamC3` — **left untouched deliberately** (explicit instruction not to
   touch this file). Whoever picks this file back up should either add an
   `acquire` alias or update the test to call `acquire_single()`.
+
+## 9. `auto_expose()` — broken fallback + no recovery after a timeout
+
+Found while debugging `helicam_test_data/helicam_test_000/run_log.txt`:
+every "optimal frame" acquire in mode 1's gain sweep came back `None`. Two
+separate bugs:
+
+- **Broken fallback when the target can't be bracketed** (`auto_expose()`'s
+  `if frac_hi < target_fraction:` branch, hit when the doubling search never
+  reaches `target_fraction` before `t_max_us`): it returns `t_hi`/`frac_hi`
+  from the *last* (failed) trial instead of the best real trial actually
+  recorded in `table`. In the logged run, ~11 earlier trials (t=1..1024µs)
+  produced valid frames, but `auto_expose` reported the broken ceiling
+  exposure (t=16380µs, frac=0) as "optimal" anyway — so the caller's next
+  `acquire_single()` at that setting timed out and returned `None`.
+- **No recovery after an `Acquire()` timeout**: once one acquisition times
+  out (`-116`), nothing resyncs the pipeline (no `AcqStop` toggle, no
+  re-`set_measurement_mode()`) before the next trial. In that run, the first
+  timeout hit mid-sweep at t=2048µs (gain=3.0), and every trial after that —
+  across all three remaining gains, down to t=1µs — timed out for the rest
+  of the run.
+
+**Status: `auto_expose()` was rewritten** (channel0/channel1 ratio-based
+saturation detection instead of an absolute intensity threshold against a
+theoretical full scale — see
+`archive/helicam_document/helicamC3_practical_knowledge_base.md` #3, and
+`auto_expose()`'s own docstring). This resolves the first bug's *symptom*:
+there is no more "pick the best `table` entry" fallback logic at all —
+the geometric-doubling phase only ever returns a `t` it just successfully
+measured (either the largest unsaturated `t` tried, via
+`ceiling_not_found=True`, or the bisection-refined saturation onset), never
+a failed trial's numbers.
+
+The second bug (no pipeline resync after a timeout) is **not fixed** — a
+failed acquisition still isn't recovered from. What changed is the
+*consequence*: a failed trial now makes `auto_expose()` stop searching
+immediately and return `ceiling_not_found=True` (fail clearly) instead of
+continuing past it and returning a bogus "success" (fail silently). Still
+worth fixing properly (resync via `AcqStop=1`→settings→`AcqStop=0`) so a
+single timeout doesn't cut a search short.
+
+**Workaround still in place:** `helicam_test.py` mode 1 still doesn't call
+`auto_expose()` — it sweeps a fixed, hardcoded log-spaced exposure list
+(`DEFAULT_MODE1_T_ACQUIRE_US_LIST`) at a single fixed gain (1x, best SNR,
+`DdsGain=2`) instead. Now that `auto_expose()` has been reworked, it's
+worth re-evaluating whether mode 1 should switch back to it — not yet
+done.
+
+**Needed to close:** add a resync/recovery step after a timeout, then
+re-verify against real hardware before mode 1 goes back to using
+`auto_expose()`.

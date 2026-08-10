@@ -5,6 +5,7 @@ Wraps the libHeLIC C library for the C3 camera system (e.g. c3cam_sl70).
 """
 
 import ctypes as ct
+import json
 import sys
 import os
 import logging
@@ -106,6 +107,28 @@ class HeliCamC3(Device):
         "AcqStop":         0,   # 0 = acquisition running (power-on default is 1 — must be set explicitly)
     }
 
+    # Register set read off a confirmed-good steady-state capture in the
+    # Heliotis heliViewer GUI. Final desired state (AcqStop ends at 0 --
+    # heliViewer, like set_measurement_mode() below, halts acquisition with
+    # AcqStop=1 first, writes everything else, then restarts with AcqStop=0).
+    # Notably includes SensNavM2/SensTqp -- STEADY_SETTINGS above sets
+    # neither, so steady mode currently inherits whatever those two demod-
+    # timing registers were last left at by an earlier mode/session instead
+    # of these values. See compare_steady_settings_to_gui_reference().
+    STEADY_SETTINGS_GUI_REFERENCE = {
+        "CamMode":         3,
+        "SensExpTime":     10,
+        "SensExpTimeMult": 0,
+        "SensExpRatio":    3,
+        "SensNDarkFrames": 7,
+        "SensNFrames":     256,
+        "BSEnable":        0,
+        "TrigFreeExtN":    1,
+        "SensNavM2":       2,
+        "SensTqp":         1392,
+        "AcqStop":         0,
+    }
+
     RAWIQ_SETTINGS = {
         "CamMode":       0,
         # Without an explicit default here, switching into rawIQ mode after
@@ -125,6 +148,17 @@ class HeliCamC3(Device):
     SENSOR_HEIGHT = 300     # helioct3 sensor, per SysDesc.xml (size="300 300")
     SENSOR_WIDTH  = 300
 
+    # Manual ch.8 "Sensor Specification": "300 (centre 292 usable; 2x4 rows
+    # are test rows)" / "300 (centre 280 usable; 2x10 columns are test
+    # columns)" -- the border pixels carry a fixed hardware self-test
+    # pattern, not photodiode data (confirmed empirically: they clip hard
+    # against 0/1023 regardless of light level -- see
+    # archive/helicam_document/helicamC3_practical_knowledge_base.md #1).
+    # Raw acquisitions are still the full SENSOR_HEIGHT x SENSOR_WIDTH --
+    # see crop_unphysical().
+    SENSOR_HEIGHT_USABLE = 292
+    SENSOR_WIDTH_USABLE  = 280
+
     # ADC output resolution -- manual §8.1/8.2 "Sensor Specification" table
     # ("Output Resolution | 10 bit", both heliSens S3.0 and S3.1 variants),
     # corroborated by §5.1: "raw_I and raw_Q values are returned, ranging
@@ -138,6 +172,17 @@ class HeliCamC3(Device):
     # set_gain() and auto_expose() so the two can't drift apart.
     ANALOGUE_GAIN_LIST = [3.0, 1.5, 1.0, 0.75]
     DDS_GAIN_CODES     = [0, 1, 2, 3]
+
+    # SensExpRatio register code -> short:long exposure ratio (register
+    # description §2.13, corroborated by manual §5.4's table): 0->1:2,
+    # 1->1:4, 2->1:8, 3->1:16. In CamMode 3, channel 0 is the long-exposure
+    # image and channel 1 is the short-exposure image -- confirmed
+    # empirically (mode6_sensexpratio_sweep), see
+    # archive/helicam_document/helicamC3_practical_knowledge_base.md #3.
+    # auto_expose() uses this ratio as a self-calibrating saturation
+    # detector: channel0/channel1 should equal this value whenever both
+    # channels are unsaturated, regardless of incident light level.
+    SENSEXPRATIO_SHORT_LONG = {0: 2, 1: 4, 2: 8, 3: 16}
 
     SEQUENCER_CLOCK_HZ = 35e6   # clock FrmDur35MHz / TDemodCyc35MHz are counted in
 
@@ -158,7 +203,7 @@ class HeliCamC3(Device):
     # dark-frame subtraction and HDR combination on-device and returning
     # SensNFrames-SensNDarkFrames-3 reduced frames. This driver instead
     # requests DF_I16Q16 (raw I/Q) and reimplements that reduction in
-    # to_numpy(). That diverges from the documented path, but STEADY_SETTINGS
+    # data_reformat(). That diverges from the documented path, but STEADY_SETTINGS
     # above records these exact values as verified end-to-end on real
     # hardware (serial 1002688069) -- so this is a known doc/code mismatch,
     # not yet confirmed as a bug. Don't "fix" it to DF_Hf without testing
@@ -316,16 +361,132 @@ class HeliCamC3(Device):
         """Apply DEFAULT_SETTINGS to the camera."""
         self.set_attributes(**self.DEFAULT_SETTINGS)
 
+    def get_registers(self, include_comments: bool = False) -> dict:
+        """
+        Read every map register the camera exposes, not just the handful
+        ``STEADY_SETTINGS``/``DEFAULT_SETTINGS`` care about -- the same
+        full list heliViewer's register dialog shows.
+
+        Read-only (one ``HE_GetMap`` per entry -- tens of calls, no
+        acquisition), so it's cheap to call regardless of how slow an
+        acquisition in the current mode would be. Useful for capturing
+        "what heliViewer actually left the camera in" to diff against
+        what this driver assumes (e.g. via ``diff_attributes()``), or for
+        spotting registers this driver doesn't know about at all.
+
+        Parameters
+        ----------
+        include_comments:
+            If True, each value becomes ``{"value": <int>, "comment": <str>}``,
+            with the comment pulled from the SDK's own register descriptor.
+            Default False for a plain ``{name: value}`` dict.
+
+        Returns
+        -------
+        dict
+            Map attribute name -> value (or value+comment dict).
+        """
+        self._require_open("dump_registers")
+        if not include_comments:
+            # self._lib.map.as_dict() does the same GetMap-per-entry walk,
+            # but leaves keys as raw bytes (b'CamMode') instead of str --
+            # a vendor-wrapper quirk (it decodes keys everywhere else, e.g.
+            # MapByName.__getattr__, but not here) -- decode for usability.
+            raw = self._lib.map.as_dict()
+            return {(k.decode("utf-8") if isinstance(k, bytes) else k): v
+                    for k, v in raw.items()}
+
+        rd = self._lib.GetRegDesc().contents
+        out = {}
+        for idx in range(rd.numMap):
+            m = rd.maps[idx]
+            out[m.id.decode("utf-8")] = {
+                "value": self._lib.GetMap(ct.pointer(m)),
+                # SDK comments are C strings in Windows-1252 (e.g. curly
+                # quotes as 0x91/0x92), not UTF-8 -- utf-8 raises on those.
+                "comment": m.cmt.decode("cp1252", errors="replace") if m.cmt else "",
+            }
+        return out
+
+    def dump_registers(self, out_dir: str, name: str = "registers", include_comments: bool = True) -> str:
+        """
+        Read every live register (``get_registers()``) and write it to
+        ``<out_dir>/<name>.json``.
+
+        Read-only, no acquisition -- safe to call any time the camera is
+        open, regardless of mode or how slow an acquisition in the current
+        mode would be. Registers own their file-IO here (unlike frames/
+        tables, which stay the test script's job -- see
+        device_interface_instruction.md) because a register dump is a
+        driver-level diagnostic: the main use is bracketing a call like
+        ``auto_expose()`` to see exactly what it left changed.
+
+        Parameters
+        ----------
+        out_dir:
+            Directory to write into. Must already exist.
+        name:
+            Output filename, without extension.
+        include_comments:
+            Passed through to ``get_registers()``.
+
+        Returns
+        -------
+        str
+            Path written.
+        """
+        registers = self.get_registers(include_comments=include_comments)
+        path = os.path.join(out_dir, name + ".json")
+        with open(path, "w") as f:
+            json.dump(registers, f, indent=2, default=str)
+        _log.info("Wrote %s (%d registers)", path, len(registers))
+        return path
+
+    def diff_attributes(self, reference: dict) -> dict:
+        """
+        Read back each attribute in ``reference`` from the live camera and
+        report where it differs.
+
+        Read-only -- just register reads (HE_GetMap), no acquisition -- so
+        it's cheap and safe to call regardless of how slow a full
+        acquisition in the current mode would be.
+
+        Parameters
+        ----------
+        reference:
+            Attribute name -> expected value, e.g. ``STEADY_SETTINGS_GUI_REFERENCE``.
+
+        Returns
+        -------
+        dict
+            ``{name: {"current": <live value>, "reference": <expected value>}}``
+            for every attribute that differs. Empty if everything matches.
+        """
+        self._require_open("diff_attributes")
+        mismatches = {}
+        for name, expected in reference.items():
+            current = self.get_attribute(name)
+            if current != expected:
+                mismatches[name] = {"current": current, "reference": expected}
+        if mismatches:
+            _log.warning("diff_attributes: %d mismatch(es) vs reference: %s", len(mismatches), mismatches)
+        else:
+            _log.info("diff_attributes: all %d attribute(s) match reference", len(reference))
+        return mismatches
+
     def get_image_shape(self) -> tuple[int, int]:
         """
-        Get the expected shape of the image returned by to_numpy().
+        Get the expected shape of the image returned by acquire_single()
+        (i.e. after crop_unphysical() has removed the border test pixels --
+        data_reformat() alone, called on uncropped data, would still be the
+        full SENSOR_HEIGHT x SENSOR_WIDTH).
 
         Returns
         -------
         tuple[int, int]
             (height, width) of the image array.
         """
-        return self.SENSOR_HEIGHT, self.SENSOR_WIDTH
+        return self.SENSOR_HEIGHT_USABLE, self.SENSOR_WIDTH_USABLE
 
 
     # ------------------------------------------------------------------
@@ -417,6 +578,24 @@ class HeliCamC3(Device):
         self._lib.AllocCamData(1, fmt, 0, 0, 0)
         self._current_cammode = cam_mode
         _log.info("Prepared mode '%s' (CamMode=%d)", modedesc, cam_mode)
+
+    def compare_steady_settings_to_gui_reference(self) -> dict:
+        """
+        Compare the live register state to ``STEADY_SETTINGS_GUI_REFERENCE``
+        (a confirmed-good steady-state capture from heliViewer).
+
+        Call after ``set_measurement_mode("steady")``. Read-only, no
+        acquisition -- intended to catch exactly the gap ``STEADY_SETTINGS``
+        currently has: it never writes ``SensNavM2``/``SensTqp``, so steady
+        mode inherits whatever those two demod-timing registers were last
+        left at by an earlier mode/session instead of heliViewer's values.
+
+        Returns
+        -------
+        dict
+            Mismatches vs the reference, see ``diff_attributes()``.
+        """
+        return self.diff_attributes(self.STEADY_SETTINGS_GUI_REFERENCE)
 
     def set_acquire_time(self, t):
         """
@@ -551,7 +730,7 @@ class HeliCamC3(Device):
         385*300*300*2*2 + 2496 bytes of header = 138,602,496.
 
         For IQ-based modes (CamMode 0 and 3) the uint16 view must be reinterpreted
-        as int16 before arithmetic — ``to_numpy()`` handles this automatically.
+        as int16 before arithmetic — ``data_reformat()`` handles this automatically.
         """
         self._require_open("acquire")
         n_bytes = self._lib.Acquire()
@@ -562,20 +741,73 @@ class HeliCamC3(Device):
         self._lib.ProcessCamData(1, 0, 0)
         return self._lib.GetCamArr(1)
 
+    def crop_unphysical(self, data: np.ndarray) -> np.ndarray:
+        """
+        Crop the sensor's non-photodiode border rows/columns out of a raw
+        acquisition, leaving the centered SENSOR_HEIGHT_USABLE x
+        SENSOR_WIDTH_USABLE pixels.
+
+        Locates the sensor's H=300, W=300 axes by shape -- works for both
+        the ``(n_frames, 300, 300, [channels])`` volume-mode layout and the
+        ``(300, 300, channels)`` surface-mode layout -- and slices them down
+        to the centered usable region.
+
+        Parameters
+        ----------
+        data:
+            Raw array as returned by ``_acquire()``: any shape containing
+            two consecutive axes of length SENSOR_HEIGHT, SENSOR_WIDTH.
+
+        Returns
+        -------
+        np.ndarray
+            Same shape, except the sensor H/W axes are cropped to
+            SENSOR_HEIGHT_USABLE x SENSOR_WIDTH_USABLE.
+
+        Raises
+        ------
+        ValueError
+            If no axis pair matching (SENSOR_HEIGHT, SENSOR_WIDTH) is found.
+        """
+        shape = data.shape
+        for axis in range(len(shape) - 1):
+            if shape[axis] == self.SENSOR_HEIGHT and shape[axis + 1] == self.SENSOR_WIDTH:
+                row0 = (self.SENSOR_HEIGHT - self.SENSOR_HEIGHT_USABLE) // 2
+                col0 = (self.SENSOR_WIDTH - self.SENSOR_WIDTH_USABLE) // 2
+                idx = [slice(None)] * data.ndim
+                idx[axis] = slice(row0, row0 + self.SENSOR_HEIGHT_USABLE)
+                idx[axis + 1] = slice(col0, col0 + self.SENSOR_WIDTH_USABLE)
+                return data[tuple(idx)]
+        raise ValueError(
+            f"crop_unphysical: no axis pair of shape "
+            f"({self.SENSOR_HEIGHT}, {self.SENSOR_WIDTH}) found in array shape {shape}"
+        )
+
     def acquire_single(self):
         """
         Helper function to acquire a single frame and return it as a numpy array.
+
+        Crops the sensor's non-photodiode border rows/columns
+        (``crop_unphysical()``) before ``data_reformat()`` -- both so no
+        downstream statistic (max/percentile/etc.) is ever computed over
+        border pixels, and so the dark-frame baseline in CamMode 3 isn't
+        itself skewed by border pixels that clip against 0/1023.
         """
         self._require_open("acquire_single")
         self.flush()
         data = self._acquire()
         if data is None:
             return None
-        return self.to_numpy(data)
+        data = self.crop_unphysical(data)
+        return self.data_reformat(data)
 
     def acquire_avg(self, n_frames: int = 10):
         """
         Acquire multiple frames in a loop and return their average.
+
+        Crops the sensor's non-photodiode border rows/columns
+        (``crop_unphysical()``) before ``data_reformat()``, same as
+        ``acquire_single()``.
         """
         self._require_open("continuous_acquire")
         self.flush()
@@ -586,7 +818,8 @@ class HeliCamC3(Device):
             data = self._acquire()
             if data is None:
                 continue
-            np_data = self.to_numpy(data)
+            data = self.crop_unphysical(data)
+            np_data = self.data_reformat(data)
             if acc is None:
                 acc = np_data.astype(np.float64)
             else:
@@ -596,90 +829,126 @@ class HeliCamC3(Device):
             return None
         return acc / count
 
-    def stream_on_trigger(self, t_acquire_s: float, n_frames: int):
-        """Not implemented -- stream frames gated on an external trigger."""
-        raise NotImplementedError
-
-    def _intensity_full_scale(self, n_frames: int = None, n_dark: int = None) -> int:
+    def save_raw_np(self, out_dir: str, name: str = "raw", mode: int = None) -> str:
         """
-        Conservative upper bound on ``to_numpy()``'s CamMode-3 intensity reduction.
-
-        ``to_numpy()`` sums the (dark-baseline-subtracted) I and Q channels
-        of every useful (non-dark) frame: ``useful_frames * 2 channels``,
-        each raw channel capped at the 10-bit ADC ceiling (``SENSOR_ADC_MAX``
-        = 1023, manual §8.1/8.2 "Output Resolution | 10 bit") before
-        subtraction. Since subtracting the (non-negative) dark baseline can
-        only reduce a sample's value, this bound is an upper bound, not
-        necessarily an exactly-reachable ceiling -- it assumes a best-case
-        zero dark baseline. If ``to_numpy()``'s reduction changes, update
-        both together (see the CamMode-3 NOTE on ``_MODE_TO_FMT`` for why
-        it's flagged as an unverified divergence from the vendor-documented
-        path).
+        Acquire one frame and save the *raw*, pre-``data_reformat()`` array
+        straight to ``<out_dir>/<name>.npz`` -- bypasses ``data_reformat()``'s
+        CamMode-specific reduction entirely, so the untouched sensor output
+        can be reprocessed later. This is the reusable form of the manual
+        ``breakpoint()`` capture used to debug ``data_reformat()`` itself
+        (see helicam_test_016's in_run_frame/dark_ref/useful.npy). Unlike
+        ``acquire_single()``, also bypasses ``crop_unphysical()`` -- the
+        saved array still includes the sensor's border test pixels, since
+        this is meant to preserve everything for later debugging.
 
         Parameters
         ----------
-        n_frames, n_dark:
-            Override ``SensNFrames``/``SensNDarkFrames``. Default to the live
-            registers when open, else ``STEADY_SETTINGS``.
+        out_dir:
+            Directory to write into. Must already exist.
+        name:
+            Output filename, without extension.
+        mode:
+            CamMode this capture should be tagged as, for later
+            reprocessing. Defaults to the live CamMode most recently set
+            via ``set_measurement_mode()``/``arm()`` -- doesn't affect
+            acquisition, just records what mode the camera was in, since a
+            raw dump alone has no memory of that once reloaded outside a
+            live driver session.
 
         Returns
         -------
-        int
-            Upper bound on the pixel value ``to_numpy()`` could return for
-            CamMode 3 given the current frame/dark-frame counts.
+        str or None
+            Path written, or None if the acquisition failed (timeout).
         """
-        if n_frames is None:
-            n_frames = (self.get_attribute("SensNFrames") if self._is_open
-                        else self.STEADY_SETTINGS["SensNFrames"])
-        if n_dark is None:
-            n_dark = (self.get_attribute("SensNDarkFrames") if self._is_open
-                      else self.STEADY_SETTINGS["SensNDarkFrames"])
-        useful_frames = max(n_frames - n_dark, 0)
-        return useful_frames * 2 * self.SENSOR_ADC_MAX
+        self._require_open("save_raw_np")
+        if mode is None:
+            mode = getattr(self, "_current_cammode", None)
+        self.flush()
+        data = self._acquire()
+        if data is None:
+            _log.warning("save_raw_np(%s): acquire failed, nothing saved", name)
+            return None
+        path = os.path.join(out_dir, name + ".npz")
+        np.savez(path, data=data, cam_mode=mode)
+        _log.info("Wrote %s (CamMode=%s, shape=%s, dtype=%s)", path, mode, data.shape, data.dtype)
+        return path
+
+    def stream_on_trigger(self, t_acquire_s: float, n_frames: int):
+        """Not implemented -- stream frames gated on an external trigger."""
+        raise NotImplementedError
 
     def auto_expose(
         self,
         target_fraction: float = 0.5,
         t_min_us: float = 1.0,
         t_max_us: float = 16380.0,
-        tol_frac: float = 0.05,
+        ratio_tol: float = 0.1,
         max_iter: int = 20,
     ) -> dict:
         """
-        Search for the exposure time that puts the intensity-mode signal at
-        ``target_fraction`` of its theoretical full scale.
+        Find the short-exposure time that puts channel 0 (the long-exposure
+        channel) ``target_fraction`` of the way to saturation, using the
+        camera's own dual-channel HDR pair as a self-calibrating saturation
+        detector -- no assumption about the sensor's absolute ADC ceiling
+        required.
 
-        Geometric bracket search (double ``t`` from ``t_min_us`` until the
-        observed fraction crosses the target, or ``t_max_us`` is hit), then
-        bisection within the bracket until ``tol_frac`` or ``max_iter``
-        trials are exhausted -- bounded per
+        In CamMode 3, channel 0 is exposed ``SensExpRatio``-times longer
+        than channel 1 (manual §5.4; ratio confirmed empirically -- see
+        ``SENSEXPRATIO_SHORT_LONG`` and
+        archive/helicam_document/helicamC3_practical_knowledge_base.md #3).
+        In the unsaturated (linear) regime, ``channel0 / channel1`` equals
+        that same nominal ratio at *any* incident light level -- it's a
+        property of the two exposure times, not of the light level itself.
+        Once channel 0 starts clipping, its growth falls behind channel 1's
+        and the observed ratio drops below nominal: a purely relative
+        signal that sidesteps ever having to know channel 0's true ADC
+        ceiling (which, per the knowledge base #2, isn't simply
+        ``SENSOR_ADC_MAX`` anyway -- the raw ~512 baseline halves the real
+        headroom).
+
+        Two-phase geometric-then-bisection search, bounded per
         device_interface_instruction.md §6 ("every blocking call has a
-        bounded timeout").
+        bounded timeout"):
+
+        1. Double ``t`` from ``t_min_us`` while the observed ratio stays
+           within ``ratio_tol`` of nominal (channel 0 still unsaturated).
+        2. Once a trial's ratio deviates, bisect between the last
+           unsaturated and first saturated ``t`` (to within 5% or 0.5µs) to
+           refine the saturation onset, ``t_saturation_onset_us``.
+        3. Set and return ``target_fraction * t_saturation_onset_us`` as
+           the operating exposure -- e.g. the default 0.5 backs off to half
+           the exposure time at which channel 0 starts clipping.
 
         Parameters
         ----------
         target_fraction:
-            Target ``frame.max() / full_scale`` ratio, e.g. 0.5 for "half max".
+            Fraction of the way to the detected saturation onset to land
+            the final exposure at, e.g. 0.5 for "halfway to saturation".
         t_min_us, t_max_us:
             Search bounds, in microseconds (same range as ``set_acquire_time``).
-        tol_frac:
-            Stop once within this distance of ``target_fraction``.
+        ratio_tol:
+            Relative deviation from the nominal ``SensExpRatio``-derived
+            ratio that counts as "channel 0 has started saturating".
         max_iter:
             Upper bound on the number of trial acquisitions.
 
         Returns
         -------
         dict
-            ``{"t_acquire_us": <best exposure>, "max_frac": <achieved fraction>,
-            "floor_limited": <bool>,
-            "table": [{"t_acquire_us", "analogue_gain", "max_val", "full_scale", "frac"}, ...]}``.
-            ``table`` has one row per trial acquisition, in call order --
-            directly usable as a saved exposure/gain/max-intensity record.
-            ``floor_limited`` is True when the signal was already at or above
-            ``target_fraction`` at ``t_min_us`` *and* still more than
-            ``tol_frac`` over target -- i.e. exposure can't be reduced any
-            further in software and the result is not actually "at target"
-            (see the ``Notes``).
+            ``{"t_acquire_us": <final exposure>,
+            "t_saturation_onset_us": <t where channel 0 starts clipping, or None>,
+            "nominal_ratio": <expected channel0/channel1 ratio from SensExpRatio>,
+            "floor_limited": <bool>, "ceiling_not_found": <bool>,
+            "table": [{"t_acquire_us", "ch0", "ch1", "ratio", "deviates"}, ...]}``.
+            ``table`` has one row per trial acquisition, in call order.
+            ``floor_limited`` is True when channel 0 is already saturating
+            at ``t_min_us`` -- exposure can't be reduced any further in
+            software. ``ceiling_not_found`` is True when the search reached
+            ``t_max_us``/``max_iter`` (or hit an acquisition failure)
+            without ever seeing the ratio deviate -- ``t_acquire_us`` falls
+            back to the largest ``t`` actually tried, and
+            ``target_fraction`` isn't meaningful in this case since no
+            saturation onset was located.
 
         Raises
         ------
@@ -687,14 +956,6 @@ class HeliCamC3(Device):
             If the camera is not open, or not already in intensity/steady
             mode -- call ``set_measurement_mode("steady")`` first. No
             implicit mode switching (matches the rest of this file).
-
-        Notes
-        -----
-        If ``frac`` is still well above ``target_fraction`` at the minimum
-        exposure, that's a real oversaturation condition (too much incident
-        light for this gain), not something a smaller ``t_acquire_us`` can
-        fix -- ``floor_limited=True`` flags this distinctly from a genuine
-        "reached target" result so it isn't mistaken for success.
         """
         self._require_open("auto_expose")
         if getattr(self, "_current_cammode", None) != 3:
@@ -703,67 +964,94 @@ class HeliCamC3(Device):
                 "call set_measurement_mode('steady') first"
             )
 
-        full_scale = self._intensity_full_scale()
-        dds_gain_code = self.get_attribute("DdsGain")
-        analogue_gain = self.ANALOGUE_GAIN_LIST[self.DDS_GAIN_CODES.index(dds_gain_code)]
+        sens_exp_ratio = self.get_attribute("SensExpRatio")
+        nominal_ratio = self.SENSEXPRATIO_SHORT_LONG[sens_exp_ratio]
         table = []
 
         def trial(t_us):
             t_us = min(max(t_us, t_min_us), t_max_us)
             self.set_acquire_time(t_us)
-            frame = self.acquire_single()
-            max_val = np.percentile(frame, 90) if frame is not None else 0
-            frac = max_val / full_scale
-            table.append({
-                "t_acquire_us": t_us, "analogue_gain": analogue_gain,
-                "max_val": max_val, "full_scale": full_scale, "frac": frac,
-            })
-            return t_us, frac
-
-        t_lo, frac_lo = trial(t_min_us)
-        if frac_lo >= target_fraction:
-            floor_limited = (frac_lo - target_fraction) > tol_frac
-            if floor_limited:
-                _log.warning(
-                    "auto_expose: signal still %.3f of full scale at the minimum "
-                    "exposure t_min_us=%.1f (target %.2f) -- cannot reduce exposure "
-                    "further; lower the gain or incident light",
-                    frac_lo, t_lo, target_fraction,
-                )
-            else:
-                _log.info("auto_expose: already at target at t_min_us=%.1f (frac=%.3f)", t_lo, frac_lo)
-            return {"t_acquire_us": t_lo, "max_frac": frac_lo, "floor_limited": floor_limited, "table": table}
-
-        t_hi, frac_hi = t_lo, frac_lo
-        while frac_hi < target_fraction and t_hi < t_max_us and len(table) < max_iter:
-            t_lo, frac_lo = t_hi, frac_hi
-            t_hi, frac_hi = trial(t_hi * 2)
-
-        if frac_hi < target_fraction:
-            _log.warning(
-                "auto_expose: never reached target_fraction=%.2f even at t_max_us=%.1f "
-                "(best frac=%.3f)", target_fraction, t_max_us, frac_hi,
+            self.flush()
+            data = self._acquire()
+            if data is None:
+                table.append({"t_acquire_us": t_us, "ch0": None, "ch1": None,
+                              "ratio": None, "deviates": None})
+                _log.warning("auto_expose trial %d: t_acquire_us=%.1f -> acquire failed",
+                             len(table), t_us)
+                return t_us, None
+            data = self.crop_unphysical(data)
+            channels = self._dark_subtract_channels(data)
+            ch0 = float(np.percentile(channels[..., 0], 99.9))
+            ch1 = float(np.percentile(channels[..., 1], 99.9))
+            ratio = (ch0 / ch1) if ch1 else float("inf")
+            deviates = ratio < nominal_ratio * (1 - ratio_tol)
+            table.append({"t_acquire_us": t_us, "ch0": ch0, "ch1": ch1,
+                          "ratio": ratio, "deviates": deviates})
+            _log.info(
+                "auto_expose trial %d: t_acquire_us=%.1f -> ch0=%.1f, ch1=%.1f, "
+                "ratio=%.2f (nominal=%d)%s",
+                len(table), t_us, ch0, ch1, ratio, nominal_ratio,
+                " [SATURATING]" if deviates else "",
             )
-            return {"t_acquire_us": t_hi, "max_frac": frac_hi, "floor_limited": False, "table": table}
+            return t_us, deviates
 
-        best_t, best_frac = t_hi, frac_hi
-        while len(table) < max_iter:
+        def not_found(t_acquire_us):
+            self.set_acquire_time(t_acquire_us)
+            return {"t_acquire_us": t_acquire_us, "t_saturation_onset_us": None,
+                    "nominal_ratio": nominal_ratio, "floor_limited": False,
+                    "ceiling_not_found": True, "table": table}
+
+        t_lo, dev_lo = trial(t_min_us)
+        if dev_lo is None:
+            _log.warning("auto_expose: initial acquisition failed, aborting")
+            return not_found(t_min_us)
+        if dev_lo:
+            _log.warning(
+                "auto_expose: channel 0 already saturating at the minimum "
+                "exposure t_min_us=%.1f -- cannot reduce exposure further; "
+                "lower the gain or incident light", t_lo,
+            )
+            return {"t_acquire_us": t_lo, "t_saturation_onset_us": t_lo,
+                    "nominal_ratio": nominal_ratio, "floor_limited": True,
+                    "ceiling_not_found": False, "table": table}
+
+        t_hi, dev_hi = t_lo, dev_lo
+        while not dev_hi and t_hi < t_max_us and len(table) < max_iter:
+            t_lo = t_hi
+            t_hi, dev_hi = trial(t_hi * 2)
+            if dev_hi is None:
+                _log.warning("auto_expose: acquisition failed mid-search, stopping at t=%.1f", t_lo)
+                return not_found(t_lo)
+
+        if not dev_hi:
+            _log.warning(
+                "auto_expose: channel 0 never saturated even at t_max_us=%.1f "
+                "-- can't locate a saturation onset in range", t_max_us,
+            )
+            return not_found(t_hi)
+
+        # Bisect [t_lo (unsaturated), t_hi (saturated)] to refine the onset.
+        while len(table) < max_iter and (t_hi - t_lo) > max(0.05 * t_hi, 0.5):
             t_mid = (t_lo + t_hi) / 2
-            t_mid, frac_mid = trial(t_mid)
-            if abs(frac_mid - target_fraction) < abs(best_frac - target_fraction):
-                best_t, best_frac = t_mid, frac_mid
-            if abs(frac_mid - target_fraction) <= tol_frac:
+            _, dev_mid = trial(t_mid)
+            if dev_mid is None:
                 break
-            if frac_mid < target_fraction:
-                t_lo = t_mid
-            else:
+            if dev_mid:
                 t_hi = t_mid
+            else:
+                t_lo = t_mid
 
+        t_saturation_onset_us = t_hi
+        final_t = min(max(target_fraction * t_saturation_onset_us, t_min_us), t_max_us)
+        self.set_acquire_time(final_t)
         _log.info(
-            "auto_expose: t_acquire_us=%.1f -> frac=%.3f (target=%.2f, %d trials)",
-            best_t, best_frac, target_fraction, len(table),
+            "auto_expose: saturation onset at t=%.1f -> final t_acquire_us=%.1f "
+            "(target_fraction=%.2f, %d trials)",
+            t_saturation_onset_us, final_t, target_fraction, len(table),
         )
-        return {"t_acquire_us": best_t, "max_frac": best_frac, "floor_limited": False, "table": table}
+        return {"t_acquire_us": final_t, "t_saturation_onset_us": t_saturation_onset_us,
+                "nominal_ratio": nominal_ratio, "floor_limited": False,
+                "ceiling_not_found": False, "table": table}
 
     def _frame_duration_s(self) -> float:
         """
@@ -1002,7 +1290,58 @@ class HeliCamC3(Device):
     # ------------------------------------------------------------------
     # 7. Data processing
     # ------------------------------------------------------------------
-    def to_numpy(self, data):
+
+    def _dark_subtract_channels(self, data: np.ndarray, n_dark: int = None) -> np.ndarray:
+        """
+        Dark-subtract and frame-average a raw CamMode-3 acquisition,
+        keeping channel 0 (long exposure) and channel 1 (short exposure)
+        separate. Shared by ``data_reformat()`` (which then sums the two
+        channels together) and ``auto_expose()`` (which needs them kept
+        apart to compare their magnitudes).
+
+        BSEnable=0 is mandatory in intensity mode (manual §5.4), so the
+        hardware doesn't suppress the per-pixel baseline itself -- the
+        first ``n_dark`` frames measure it, averaged and subtracted from
+        the rest. Confirmed necessary on real hardware: without this, a 10x
+        drop in incident light changed the combined value by <1%
+        (baseline-dominated), which made auto_expose() chase a signal that
+        wasn't tracking light level.
+
+        Averaging (not summing) over frames is deliberate -- see the
+        CamMode-3 NOTE on ``_MODE_TO_FMT`` -- so ``SensNFrames`` stays a
+        noise-averaging knob, not a light-budget one. Subtracting the
+        (per-pixel/channel constant) dark reference commutes with
+        averaging, so doing it after rather than before the frame-average
+        is equivalent and cheaper.
+
+        Parameters
+        ----------
+        data:
+            Raw array from ``_acquire()`` (optionally already
+            ``crop_unphysical()``'d), shape ``(n_frames, H, W, 2)``.
+        n_dark:
+            Number of leading dark frames. Defaults to the live
+            ``SensNDarkFrames`` register when open, else
+            ``STEADY_SETTINGS``.
+
+        Returns
+        -------
+        np.ndarray
+            ``(H, W, 2)`` float64: dark-subtracted, averaged over the
+            remaining frames.
+        """
+        if n_dark is None:
+            n_dark = self.STEADY_SETTINGS.get('SensNDarkFrames', 10)
+            if self._is_open:
+                try:
+                    n_dark = self.get_attribute('SensNDarkFrames')
+                except Exception:
+                    pass
+        # IQ bytes are signed; GetCamArr reads them as uint16 → reinterpret.
+        arr = data.view(np.int16).astype(np.float64)   # (n_frames, H, W, 2)
+        dark_ref = arr[:n_dark].mean(axis=0)            # (H, W, 2)
+        return arr[n_dark:].mean(axis=0) - dark_ref     # (H, W, 2)
+    def data_reformat(self, data, mode=None):
         """
         Post-process raw acquire() output into a spatially meaningful array.
 
@@ -1021,8 +1360,11 @@ class HeliCamC3(Device):
               ``SensNDarkFrames`` frames are averaged into a per-pixel
               baseline and subtracted from the remaining frames (BSEnable=0
               in intensity mode means the hardware doesn't do this itself);
-              I/Q channels are then summed to yield a baseline-subtracted
-              HDR intensity image.
+              the remaining frames are then averaged (not summed --
+              SensNFrames is purely a noise-averaging knob here, not a
+              light-budget one) and their I/Q channels summed to yield a
+              baseline-subtracted intensity image, scaled to the sensor's
+              native per-frame ADC range independent of SensNFrames.
             * **CamMode 0 – raw IQ**: int16 volume (n_frames × 300 × 300 × 2),
               unscaled raw ADC counts (0-1023 nominal range) — use
               ``iq_to_amplitude()`` to convert to physical amplitude.
@@ -1041,33 +1383,16 @@ class HeliCamC3(Device):
             silently wrong rather than merely unimplemented (see
             device_interface_instruction.md §2).
         """
-        cam_mode = getattr(self, '_current_cammode', None)
+        cam_mode = mode if mode is not None else getattr(self, '_current_cammode', None)
         if cam_mode is None and self._is_open:
             cam_mode = self.get_attribute('CamMode')
 
         if cam_mode == 3:
-            # IQ bytes are signed; GetCamArr reads them as uint16 → reinterpret.
-            arr = data.view(np.int16)           # shape: (n_frames, 300, 300, 2)
-            n_dark = self.STEADY_SETTINGS.get('SensNDarkFrames', 10)
-            if self._is_open:
-                try:
-                    n_dark = self.get_attribute('SensNDarkFrames')
-                except Exception:
-                    pass
-            # BSEnable=0 is mandatory in intensity mode (manual §5.4), which
-            # disables the hardware's own bias/offset suppression -- so every
-            # raw I/Q sample below still carries a per-pixel electronic
-            # baseline that has nothing to do with incident light. The first
-            # n_dark frames of the burst exist to measure exactly that
-            # baseline; average them and subtract per-pixel/per-channel
-            # before summing, instead of just discarding them. Confirmed
-            # necessary on real hardware: without this, a 10x reduction in
-            # incident light changed the summed value by <1% (baseline-
-            # dominated), which made auto_expose() chase a signal that
-            # wasn't actually tracking light level.
-            dark_ref = arr[:n_dark].astype(np.float64).mean(axis=0)   # (300, 300, 2)
-            useful = arr[n_dark:].astype(np.float64) - dark_ref[np.newaxis, ...]
-            return useful.sum(axis=0).sum(axis=-1)   # (300, 300) HDR intensity, baseline-subtracted
+            # Channel 0 (long exposure) + channel 1 (short exposure) summed
+            # -- see _dark_subtract_channels() for the dark-baseline
+            # subtraction and frame-averaging this builds on.
+            channels = self._dark_subtract_channels(data)   # (300, 300, 2): [long, short]
+            return channels.sum(axis=-1)   # (300, 300) float64, baseline-subtracted
 
         elif cam_mode == 0:
             # Raw IQ — return signed volume unchanged, still raw ADC counts.
@@ -1086,7 +1411,7 @@ class HeliCamC3(Device):
 
         else:
             raise NotImplementedError(
-                f"to_numpy(): CamMode {cam_mode} has no documented conversion "
+                f"data_reformat(): CamMode {cam_mode} has no documented conversion "
                 f"implemented (only 0, 1, 3, 4, 7 are)"
             )
 
@@ -1105,7 +1430,7 @@ class HeliCamC3(Device):
         ----------
         I, Q:
             Raw in-phase/quadrature arrays (e.g. from ``read_frame()`` or a
-            slice of a CamMode-0 ``to_numpy()`` volume).
+            slice of a CamMode-0 ``data_reformat()`` volume).
         offset_I, offset_Q:
             Per-channel DC offset to subtract before combining. Default to
             512 -- the manual's documented nominal ADC center for a
