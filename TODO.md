@@ -142,19 +142,7 @@ see the knowledge base for the full per-CamMode size table.
 
 ---
 
-## 3. ~~Cleanup — redundant `AcqStop=1` calls in `mode2_lockin()`~~ — done
-
-Done. The three redundant `cam.set_attributes(AcqStop=1)` calls (after
-`steady`, `rawIQ`, `amplitude`) were removed from `mode2_lockin()`
-(`moke/devices/helicam_test.py`) — each was immediately re-issued (then
-reversed back to 0) by the very next `set_measurement_mode()` call anyway,
-per that method's own halt-then-restart sequence, so they had no
-observable effect beyond a harmless extra register write. Only the final
-one (after `smooth_amplitude`) remains, since nothing restarts acquisition
-after it — it parks the camera stopped when `mode2_lockin()` returns,
-mirroring the `AcqStop=1` in `close()`. No behavior change, compiles
-clean; not separately re-tested on hardware (low risk — pure removal of
-writes that were already provably no-ops).
+## 3. test the effectness of FWHMnFrame in smooth_amplitude run
 
 ---
 
