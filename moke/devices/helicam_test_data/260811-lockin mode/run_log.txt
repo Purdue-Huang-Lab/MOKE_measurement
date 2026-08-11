@@ -1,0 +1,30 @@
+09:41:05.676 INFO:__main__:Logging to C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_002\run_log.txt
+09:41:07.967 INFO:moke.devices.helicam:Camera 'c3cam_sl70' opened (handle=0x1f21b821bf0, res=1)
+09:41:07.967 INFO:__main__:Camera opened: {'open': True, 'sys_id': 'c3cam_sl70', 'cam_mode': None}
+09:41:07.985 INFO:moke.devices.helicam:Prepared mode 'steady' (CamMode=3)
+09:41:07.988 INFO:__main__:[   19.7 ms] set_measurement_mode('steady')
+09:41:07.988 INFO:moke.devices.helicam:Set analogue gain to 1.0x (DdsGain=2)
+09:41:07.988 INFO:__main__:[    1.2 ms] set_gain(1.0)
+09:41:07.997 INFO:moke.devices.helicam:Set exposure: SensExpTime=16 µs × (SensExpTimeMult=0+1) = 16.0 µs actual
+09:41:08.000 INFO:__main__:[   11.0 ms] set_acquire_time(16.0)
+09:41:08.020 INFO:moke.devices.helicam:Wrote C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_002\mode2_registers_at_start.json (79 registers)
+09:41:10.611 INFO:moke.devices.helicam:Flushed 1 stale frame(s) from USB buffer
+09:41:10.755 INFO:__main__:[ 2730.9 ms] acquire_single() [steady]
+09:41:10.769 INFO:moke.devices.helicam:Prepared mode 'rawIQ' (CamMode=0)
+09:41:10.769 INFO:__main__:[   11.7 ms] set_measurement_mode('rawIQ')
+09:41:13.350 INFO:moke.devices.helicam:Flushed 1 stale frame(s) from USB buffer
+09:41:16.296 INFO:__main__:[ 5529.5 ms] acquire_single() [rawIQ]
+09:41:16.308 INFO:__main__:Mode 2: rawIQ amplitude -- shape=(292, 280) mean=110.4
+09:41:16.324 INFO:moke.devices.helicam:Prepared mode 'amplitude' (CamMode=1)
+09:41:16.324 INFO:__main__:[   13.8 ms] set_measurement_mode('amplitude')
+09:41:17.412 INFO:moke.devices.helicam:Flushed 1 stale frame(s) from USB buffer
+09:41:18.811 INFO:__main__:[ 2492.5 ms] acquire_single() [amplitude]
+09:41:18.811 INFO:__main__:Mode 2: amplitude -- mean=2.1
+09:41:18.831 INFO:moke.devices.helicam:Prepared mode 'smooth_amplitude' (CamMode=2)
+09:41:18.831 INFO:__main__:[   11.0 ms] set_measurement_mode('smooth_amplitude')
+09:41:20.079 INFO:moke.devices.helicam:Flushed 1 stale frame(s) from USB buffer
+09:41:21.384 INFO:__main__:[ 2555.3 ms] acquire_single() [smooth_amplitude]
+09:41:21.384 INFO:__main__:Mode 2: smooth amplitude -- mean=2.0
+09:41:27.345 INFO:moke.devices.helicam:Wrote C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_002\registers.json (79 registers)
+09:41:27.352 INFO:moke.devices.helicam:Camera closed (res=0)
+09:41:27.352 INFO:__main__:Done. Output in C:\Users\Huang Lab\Documents\GitHub\MOKE_measurement\moke\devices\helicam_test_data\helicam_test_002

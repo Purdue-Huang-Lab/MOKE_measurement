@@ -6,8 +6,8 @@ Seven modes, one bench checkout item each. Each run creates a fresh
 repeated runs never clobber each other's data. Regardless of mode, every
 run finishes by dumping the full live register set to ``registers.json``
 (see ``HeliCamC3.dump_registers()``) -- a cheap, always-useful record of
-exactly what state the camera was left in. Modes 2/3/4 additionally dump
-registers immediately before and after each ``auto_expose()`` call, to
+exactly what state the camera was left in. Mode 4 additionally dumps
+registers immediately before and after its ``auto_expose()`` call, to
 catch what that search itself changes.
 
 Usage::
@@ -26,23 +26,28 @@ Mode 1 -- lifecycle / exposure characterization:
     table. Does NOT use auto_expose() -- see open_issue_helicam.md #9.
 
 Mode 2 -- lock-in detection:
-    open -> steady mode -> auto_expose() -> steady frame -> rawIQ mode ->
-    convert I/Q to amplitude -> minE mode -> amplitude+Z. Saves every image
-    and the run parameters.
+    open -> steady mode at a fixed exposure -> steady frame -> rawIQ mode ->
+    convert I/Q to amplitude -> amplitude mode -> smoothed amplitude mode.
+    Saves every image and the run parameters. Does NOT use auto_expose()
+    -- see mode 4. minE is not exercised here (not useful for this rig's
+    purposes) -- still covered by mode 3's second stream. rawIQ's
+    offset_I/offset_Q source is controlled by ``--offset-method``
+    (self/null, default self) -- see mode2_lockin()'s docstring.
 
 Mode 3 -- streaming:
-    open -> steady mode -> auto_expose() -> live matplotlib preview at up to
-    10 fps (throttled to the camera's own estimated acquire time if slower)
-    with Pause / Start / Save frame / Move on buttons -> switch to minE mode
-    -> stream again.
+    open -> steady mode at a fixed exposure -> live matplotlib preview at up
+    to 10 fps (throttled to the camera's own estimated acquire time if
+    slower) with Pause / Start / Save frame / Move on buttons -> switch to
+    amplitude mode -> stream again. Does NOT use auto_expose() -- see mode 4.
 
 Mode 4 -- auto_expose() checkout:
     open -> steady mode -> gain=1x (DdsGain=2) -> auto_expose() -> record
-    the full search trial table + final frame. Exists to exercise/verify
-    auto_expose() on real hardware in isolation rather than buried inside
-    modes 2/3. auto_expose() detects saturation via the channel0/channel1
-    ratio (see helicamC3_practical_knowledge_base.md #3), not an absolute
-    intensity threshold -- see its docstring in helicam.py.
+    the full search trial table + final frame. The only mode that calls
+    auto_expose() -- exercises/verifies it on real hardware in isolation
+    rather than buried inside another mode's pipeline (modes 1/2/3 all use
+    fixed exposures instead). auto_expose() detects saturation via the
+    channel0/channel1 ratio (see helicamC3_practical_knowledge_base.md #3),
+    not an absolute intensity threshold -- see its docstring in helicam.py.
 
 Mode 5 -- SensNFrames sweep:
     open -> steady mode -> gain=1x (DdsGain=2) -> t_acquire_us=1.0 (the
@@ -135,9 +140,9 @@ def _timed(label: str, fn, *args, level: int = logging.INFO, **kwargs):
     ``helicam.py`` itself stays free of timing/instrumentation code (it's a
     device driver, not a profiler); all per-call timing lives here instead.
     """
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     result = fn(*args, **kwargs)
-    dt_ms = (time.monotonic() - t0) * 1000.0
+    dt_ms = (time.perf_counter() - t0) * 1000.0
     _log.log(level, "[%7.1f ms] %s", dt_ms, label)
     return result
 
@@ -257,55 +262,126 @@ def mode1_lifecycle(cam: HeliCamC3, out_dir: str, t_acquire_us_list) -> None:
 
 
 # ----------------------------------------------------------------------
-# Mode 2 -- lock-in detection (rawIQ + minE)
+# Mode 2 -- lock-in detection (rawIQ + amplitude + smooth_amplitude)
 # ----------------------------------------------------------------------
 
-def mode2_lockin(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
-    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
-    _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
-    cam.dump_registers(out_dir, "mode2_registers_before_autoexpose")
-    result = _timed("auto_expose()", cam.auto_expose, target_fraction=0.5)
-    cam.dump_registers(out_dir, "mode2_registers_after_autoexpose")
-    _log.info("Mode 2: auto_expose -> t_acquire_us=%.1f (saturation onset=%s us)",
-               result["t_acquire_us"], result["t_saturation_onset_us"])
+def mode2_lockin(cam: HeliCamC3, out_dir: str, t_acquire_us: float, offset_method: str = "self") -> None:
+    """
+    Fixed exposure -> steady frame -> rawIQ (converted to amplitude) ->
+    amplitude mode -> smoothed amplitude mode. Saves every image and the
+    run parameters.
 
+    minE is deliberately not exercised here -- not useful for this rig's
+    purposes (still covered by mode 3's second stream). This mode instead
+    covers the three amplitude-producing paths side by side: rawIQ's raw
+    I/Q converted in Python (``iq_to_amp_phase()``) vs. CamMode 1's
+    on-device amplitude vs. CamMode 2's on-device FWHMnFrame-filtered
+    ("smoothed") amplitude -- useful for comparing whether the on-device
+    smoothing actually buys anything over the raw computation.
+
+    Parameters
+    ----------
+    offset_method:
+        How to determine ``offset_I``/``offset_Q`` for rawIQ's
+        ``iq_to_amp_phase()`` conversion -- CamMode 0 has no on-device
+        offset correction (``OffsetMethod`` doesn't apply to it, register
+        description §2.18), so the manual's nominal 512 leaves a large
+        per-camera residual (measured ~88/~67 counts off on this camera --
+        see helicamC3_practical_knowledge_base.md). Two options, to A/B
+        against each other:
+        "self": use this same capture's own per-pixel I/Q mean as a
+            single scalar offset -- free (no extra acquisition), but
+            assumes there's no real slow-varying signal riding on top of
+            the DC bias in this exact frame.
+        "null": call ``cam.null_offset()`` for a dedicated, per-pixel
+            calibration acquisition just before the real capture -- only
+            actually different from "self" if there's genuinely no
+            modulated signal present while it runs (light blocked / demod
+            frequency detuned); otherwise it just measures the same
+            signal-plus-offset a second time.
+    """
+    if offset_method not in ("self", "null"):
+        raise ValueError(f"offset_method must be 'self' or 'null', got {offset_method!r}")
+
+    # set_measurement_mode() now discards its own warm-up acquisition by
+    # default (settling artifact confirmed on real hardware -- see
+    # helicamC3_practical_knowledge_base.md), so the manual
+    # discard-first-acquisition workaround that used to live here is gone.
+    _timed("set_measurement_mode('steady', SensExpRatio=1)",
+           cam.set_measurement_mode, "steady", SensExpRatio=1)  # start with ratio = 4
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+    _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+    cam.dump_registers(out_dir, "mode2_registers_at_start")
     steady_frame = _timed("acquire_single() [steady]", cam.acquire_single)
     save_frame(out_dir, "mode2_steady_frame", steady_frame)
 
     _timed("set_measurement_mode('rawIQ')", cam.set_measurement_mode, "rawIQ")
-    raw_iq = _timed("acquire_single() [rawIQ]", cam.acquire_single)   # (n_frames, 300, 300, 2) int16, raw ADC counts
+
+    if offset_method == "null":
+        _log.info("Mode 2: measuring null_offset() -- make sure no modulated "
+                   "signal is present (light blocked / demod detuned) right now")
+        offset_I, offset_Q = _timed("null_offset()", cam.null_offset)
+
+    raw_iq = _timed("acquire_single() [rawIQ]", cam.acquire_single)   # (292, 280, 2) float64, frame-averaged: [...,0]=I, [...,1]=Q
     if raw_iq is None:
         raise RuntimeError("mode2: rawIQ acquire_single() returned no data")
     I, Q = raw_iq[..., 0], raw_iq[..., 1]
-    rawiq_amplitude = HeliCamC3.iq_to_amplitude(I, Q).mean(axis=0)   # average over the volume's frames
-    save_frame(out_dir, "mode2_rawiq_amplitude", rawiq_amplitude)
-    _log.info("Mode 2: rawIQ amplitude -- shape=%s mean=%.1f", rawiq_amplitude.shape, rawiq_amplitude.mean())
 
-    _timed("set_measurement_mode('minimum_energy')", cam.set_measurement_mode, "minimum_energy")
-    minE_frame = _timed("acquire_single() [minE]", cam.acquire_single)   # (300, 300, 2) float32: [...,0]=amplitude, [...,1]=Z
-    if minE_frame is None:
-        raise RuntimeError("mode2: minE acquire_single() returned no data")
-    save_frame(out_dir, "mode2_minE_amplitude", minE_frame[..., 0])
-    save_frame(out_dir, "mode2_minE_z", minE_frame[..., 1])
-    _log.info("Mode 2: minE amplitude -- mean=%.1f", minE_frame[..., 0].mean())
+    if offset_method == "self":
+        offset_I, offset_Q = float(I.mean()), float(Q.mean())
+
+    rawiq_amplitude, rawiq_phase = HeliCamC3.iq_to_amp_phase(I, Q, offset_I=offset_I, offset_Q=offset_Q)
+    save_frame(out_dir, "mode2_rawiq_I", I)
+    save_frame(out_dir, "mode2_rawiq_Q", Q)
+    save_frame(out_dir, "mode2_rawiq_amplitude", rawiq_amplitude)
+    save_frame(out_dir, "mode2_rawiq_phase", rawiq_phase)
+    _log.info(
+        "Mode 2: rawIQ amplitude -- offset_method=%s (offset_I=%.1f, offset_Q=%.1f) "
+        "shape=%s mean=%.1f",
+        offset_method, np.mean(offset_I), np.mean(offset_Q),
+        rawiq_amplitude.shape, rawiq_amplitude.mean(),
+    )
+
+    _timed("set_measurement_mode('amplitude')", cam.set_measurement_mode, "amplitude")
+    amplitude_frame = _timed("acquire_single() [amplitude]", cam.acquire_single)   # (292, 280) float32, frame-averaged
+    if amplitude_frame is None:
+        raise RuntimeError("mode2: amplitude acquire_single() returned no data")
+    save_frame(out_dir, "mode2_amplitude_frame", amplitude_frame)
+    _log.info("Mode 2: amplitude -- mean=%.1f", amplitude_frame.mean())
+
+    _timed("set_measurement_mode('smooth_amplitude')", cam.set_measurement_mode, "smooth_amplitude")
+    smooth_amplitude_frame = _timed("acquire_single() [smooth_amplitude]", cam.acquire_single)   # (292, 280) float32, frame-averaged
+    if smooth_amplitude_frame is None:
+        raise RuntimeError("mode2: smooth_amplitude acquire_single() returned no data")
+    save_frame(out_dir, "mode2_smooth_amplitude_frame", smooth_amplitude_frame)
+    _log.info("Mode 2: smooth amplitude -- mean=%.1f", smooth_amplitude_frame.mean())
+    cam.set_attributes(AcqStop = 1) # stop acquisition
 
     save_json(out_dir, "mode2_params", {
-        "t_acquire_us": result["t_acquire_us"],
-        "t_saturation_onset_us": result["t_saturation_onset_us"],
-        "nominal_ratio": result["nominal_ratio"],
+        "t_acquire_us": t_acquire_us,
         "gain_DdsGain": cam.get_attribute("DdsGain"),
+        "FWHMnFrame": cam.SMOOTH_AMPLITUDE_SETTINGS["FWHMnFrame"],
+        "offset_method": offset_method,
+        "offset_I_mean": float(np.mean(offset_I)),
+        "offset_Q_mean": float(np.mean(offset_Q)),
     })
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes = axes.flatten()
     for ax, (title, img) in zip(axes, [
         ("steady", steady_frame),
+        ("rawIQ I", I),
+        ("rawIQ Q", Q),
         ("rawIQ amplitude", rawiq_amplitude),
-        ("minE amplitude", minE_frame[..., 0]),
+        ("rawIQ phase", rawiq_phase),
+        ("amplitude", amplitude_frame),
+        ("smooth amplitude", smooth_amplitude_frame),
     ]):
         im = ax.imshow(img, cmap="gray")
         ax.set_title(title)
         fig.colorbar(im, ax=ax)
-    fig.suptitle("Mode 2: lock-in detection")
+    fig.suptitle(f"Mode 2: lock-in detection (offset_method={offset_method}, "
+                 f"offset_I={np.mean(offset_I):.1f}, offset_Q={np.mean(offset_Q):.1f})")
     fig.savefig(os.path.join(out_dir, "mode2_summary.png"))
     plt.show()
 
@@ -401,16 +477,12 @@ def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
 def mode3_streaming(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
     _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
     _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
-    cam.dump_registers(out_dir, "mode3_registers_before_autoexpose")
-    result = _timed("auto_expose()", cam.auto_expose, target_fraction=0.5)
-    cam.dump_registers(out_dir, "mode3_registers_after_autoexpose")
-    _log.info("Mode 3: auto_expose -> t_acquire_us=%.1f (saturation onset=%s us)",
-               result["t_acquire_us"], result["t_saturation_onset_us"])
+    cam.dump_registers(out_dir, "mode3_registers")
 
     stream(cam, out_dir, "steady", fps=10.0)
 
-    _timed("set_measurement_mode('minimum_energy')", cam.set_measurement_mode, "minimum_energy")
-    stream(cam, out_dir, "minE", fps=10.0)
+    _timed("set_measurement_mode('amplitude')", cam.set_measurement_mode, "amplitude")
+    stream(cam, out_dir, "amplitude", fps=10.0)
 
 
 # ----------------------------------------------------------------------
@@ -422,9 +494,9 @@ def mode4_autoexpose(cam: HeliCamC3, out_dir: str, target_fraction: float) -> No
     Fixed gain=1x (best SNR, DdsGain=2) -> auto_expose() -> record its full
     search trial table plus the final frame at the exposure it settled on.
 
-    Isolated from modes 2/3 (which also call auto_expose() but bury its
-    result inside a larger pipeline) so its search behaviour can be checked
-    against real hardware on its own. auto_expose() detects saturation via
+    The only mode that calls auto_expose() -- modes 1/2/3 all use fixed
+    exposures instead -- so its search behaviour can be checked against
+    real hardware in isolation. auto_expose() detects saturation via
     the channel0/channel1 ratio (see
     helicamC3_practical_knowledge_base.md #3) instead of an absolute
     intensity threshold -- this mode's plot shows that ratio holding near
@@ -659,9 +731,9 @@ def mode7_no_flush_raw(cam: HeliCamC3, out_dir: str, t_old_us: float, t_new_us: 
     n_dark = cam.STEADY_SETTINGS["SensNDarkFrames"]
     rows = []
     for i in range(n_acquisitions):
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         data = cam._acquire()
-        dt_ms = (time.monotonic() - t0) * 1000.0
+        dt_ms = (time.perf_counter() - t0) * 1000.0
         if data is None:
             _log.warning("Mode 7: acquisition %d failed (%.1f ms)", i, dt_ms)
             rows.append({"index": i, "t_ms": dt_ms, "ch0_mean": None, "ch1_mean": None})
@@ -711,6 +783,10 @@ def main():
     parser.add_argument("--target-fraction", type=float, default=0.5,
                          help="auto_expose() target fraction of the way to the detected "
                               "saturation onset, mode 4 (default: %(default)s)")
+    parser.add_argument("--offset-method", type=str, choices=["self", "null"], default="self",
+                         help="rawIQ offset_I/offset_Q source, mode 2: 'self' (this capture's "
+                              "own mean, free) or 'null' (dedicated null_offset() calibration -- "
+                              "requires no modulated signal present when it runs) (default: %(default)s)")
     args = parser.parse_args()
 
     out_dir = make_test_dir()
@@ -721,7 +797,7 @@ def main():
         if args.mode == 1:
             mode1_lifecycle(cam, out_dir, DEFAULT_MODE1_T_ACQUIRE_US_LIST)
         elif args.mode == 2:
-            mode2_lockin(cam, out_dir, args.t_acquire_us)
+            mode2_lockin(cam, out_dir, args.t_acquire_us, args.offset_method)
         elif args.mode == 3:
             mode3_streaming(cam, out_dir, args.t_acquire_us)
         elif args.mode == 4:

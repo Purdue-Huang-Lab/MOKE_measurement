@@ -1,0 +1,318 @@
+{
+  "SegVolume": {
+    "value": 0,
+    "comment": "Use segmented volume sequencer"
+  },
+  "ExtTqp": {
+    "value": 0,
+    "comment": "tqp from motor measurement instead from internal clock"
+  },
+  "SingleVolume": {
+    "value": 0,
+    "comment": "Single volume acquisition (acq_stop will be set after one volume)"
+  },
+  "TrigFreeExtN": {
+    "value": 1,
+    "comment": "true: produce internal triggersignal false: external determinated by ext_trg_src"
+  },
+  "TrigExtSrcSel": {
+    "value": 0,
+    "comment": "false: extrenal trigger port, true: trigger from Z-motor control"
+  },
+  "AcqStop": {
+    "value": 0,
+    "comment": "true: aquisition is stopped (default), false: aquisition is running"
+  },
+  "DoSeqRld": {
+    "value": 0,
+    "comment": "trigger sequencer reloading, register is cleared when done"
+  },
+  "CamMode": {
+    "value": 3,
+    "comment": "Select camera mode"
+  },
+  "VolReady": {
+    "value": 0,
+    "comment": "read only: indicates that a volume is ready for read out in the first mem"
+  },
+  "MemSoftRes": {
+    "value": 0,
+    "comment": "true: forces the write statemachine of the AB memory to go to idle, false: normal mode"
+  },
+  "CalDur1Cyc": {
+    "value": 1,
+    "comment": "true: Offsetcompensation takes 1 cycle, false: Offsetcompensation takes reg value"
+  },
+  "SensCfgBusy": {
+    "value": 1,
+    "comment": "read only: indicates that configuration data is being downloaded and that camera should not be triggered"
+  },
+  "ExtTqpPuls": {
+    "value": 0,
+    "comment": "true: External TQP pulses are generated on both channels, false: External TQP pulses are generated on one channel only"
+  },
+  "CalSurfWhileAcq": {
+    "value": 0,
+    "comment": "0: Normal acquisition mode (new measurement after results are transferred tohost) 1: high speed acquisition mode (new measurement while surface calculations are in process). Do not use ztags from header inthis case!"
+  },
+  "EnSBIS": {
+    "value": 0,
+    "comment": "0: No Sensor Built in Self test, 1: Sensor Built in Self test enabled -> electrical stimulation of sensor. sensor built in stimulus is not used for extTQP or intensity mode"
+  },
+  "DoBist": {
+    "value": 0,
+    "comment": "trigger BIST, register is cleared when done. Make sure acquisition_stop=1 and no data remains to be fetched (DDR memory will be overwritten)"
+  },
+  "EnSynFOut": {
+    "value": 0,
+    "comment": "0: Disables synchronization signal on OUT3 (rectangular waveform with demodulation frequency fd, see appendix A2) 1: Enables synchronization signal on OUT3"
+  },
+  "OutEnDrv": {
+    "value": 0,
+    "comment": "0: Set OutEnDrv output to 0, 1: Set OutEnDrv output to 1 (Pin 5 on camera connector)"
+  },
+  "Out1": {
+    "value": 0,
+    "comment": "0: Set general purpose output Out1 to 0, 1:Set general purpose output to 1"
+  },
+  "In1": {
+    "value": 0,
+    "comment": "General purpose input In1 (read only)"
+  },
+  "InvEncCnt": {
+    "value": 1,
+    "comment": "Invert encoder counter from Camera"
+  },
+  "EnSprOsc": {
+    "value": 0,
+    "comment": "0: Disable spread spectrum oscillator, 1: Enable spread spectrum oscillator"
+  },
+  "SoftRes": {
+    "value": 0,
+    "comment": "hold FPGA in soft reset mode"
+  },
+  "PowerCtrl": {
+    "value": 33,
+    "comment": "Power control: T120Deg: Length of one third of the synchronisation period for sensor board power regulators 200MHz system clock cycles"
+  },
+  "MskTrgOnPos": {
+    "value": 0,
+    "comment": "0: clear cnt from ext 1: mask clear cnt from ext"
+  },
+  "TrgDown": {
+    "value": 0,
+    "comment": "0: TriggerUp 1: TriggerDown"
+  },
+  "ClrPosCnt": {
+    "value": 0,
+    "comment": "1: Sets position counter to 0 (reset to 0) "
+  },
+  "EnTrigOnPos": {
+    "value": 0,
+    "comment": "1: enabled or 0: disabled Trigger on Position feature"
+  },
+  "TrigOnPos": {
+    "value": 0,
+    "comment": "Position (Encoder value) where a trigger is generated. Only active if \u2018TrigOnPos\u2019 feature is enabled"
+  },
+  "SensTqp": {
+    "value": 29,
+    "comment": "tqp= fs/(8*fd)-30 with fs=70MHz(Sensorclock), fd (demodFreq)"
+  },
+  "SensNavM2": {
+    "value": 48,
+    "comment": "Number of averaging/demodulating cycles per frame: SensNavM2 x 2 + 2 (from symmetrical sequencer) "
+  },
+  "SensNFrames": {
+    "value": 256,
+    "comment": "Number of demodulation images taken per acquisition"
+  },
+  "FrmDur35MHz": {
+    "value": 23364,
+    "comment": "Frame duration T Frame  between two consecutive frames. Value in 1/35Mhz sequencer clock cycles."
+  },
+  "TDemodCyc35MHz": {
+    "value": 236,
+    "comment": "Duration of a sensor demodulation cycle in 1/35MHz clock cycles. "
+  },
+  "SensDeltaExp": {
+    "value": 0,
+    "comment": "Duration of a sensor demodulation cycle in 1/35MHz clock cycles. "
+  },
+  "LoadTestSeq": {
+    "value": 0,
+    "comment": "Sets all data from sensor to zero"
+  },
+  "BSEnable": {
+    "value": 0,
+    "comment": "true: Background suppression on, false: BS off"
+  },
+  "DdsGain": {
+    "value": 2,
+    "comment": "internal voltage gain, 3:0.75, 2:1, 1:1.5, 0:3"
+  },
+  "SensExpTimeMult": {
+    "value": 0,
+    "comment": "Multiplier to calculate long exposure time for intensity mode. (LongExpTime = SensExpTime * ((SensExpTimeMult+1)*2)) "
+  },
+  "SensExpRatio": {
+    "value": 3,
+    "comment": "Dead time to comply with the frame rate. "
+  },
+  "SensNDarkFrames": {
+    "value": 7,
+    "comment": "Number of dark frames for offset compensation. (SensNFrames-SensNDarkFrames) > 2"
+  },
+  "SensExpTime": {
+    "value": 16,
+    "comment": "Short exposure time in intensity mode."
+  },
+  "SensCaldur": {
+    "value": 2444,
+    "comment": "Number of sequencer cycles for the offsetcompensation, only if CalDur1Cyc = false"
+  },
+  "SigTsh": {
+    "value": 1,
+    "comment": "Signal threshold, peak is considered as noise (simpleMax),Offsetmetric in header (#Ascans in +-SigTsh)"
+  },
+  "FWHMnFrame": {
+    "value": 3,
+    "comment": "Full With Half Max of the signal envelope in frames, 000: 0, 001: 2, 010: 6, 011: 10, 100: 20"
+  },
+  "Comp11to8": {
+    "value": 0,
+    "comment": "Amplitude Compression 11 bit to 8 bit"
+  },
+  "BiasI": {
+    "value": 0,
+    "comment": "Bias value on I for the first two frames of the volume (10Bit)"
+  },
+  "BiasQ": {
+    "value": 0,
+    "comment": "Bias value on Q for the first two frames of the volume (10Bit)"
+  },
+  "OffsetMethod": {
+    "value": 0,
+    "comment": "0: Offset determined by histogram method, 1:Offset determined by averaging"
+  },
+  "UseLastFrame": {
+    "value": 0,
+    "comment": "0: First frames are used in averaging mode, 1: Last frames are used in averaging mode"
+  },
+  "NFrmAvg": {
+    "value": 3,
+    "comment": "Number of frames used for averaging nAvg = 2^(NFrmAvg) - 1"
+  },
+  "HistStrt": {
+    "value": 0,
+    "comment": "Start address of Histogram"
+  },
+  "HistPixOut": {
+    "value": 3,
+    "comment": "HistPixOut*8 = Allowed number of pixels outside the margin (+-SigTsh)"
+  },
+  "HistEnd": {
+    "value": 255,
+    "comment": "End address of Histogram"
+  },
+  "ExSimpMaxHwin": {
+    "value": 5,
+    "comment": "Half window size in the extended simple max CamMode. The maximum half window size is 10 (default is 5), which results in a window size of 21."
+  },
+  "FirstSurfAtsh": {
+    "value": 0,
+    "comment": "First surface detection register"
+  },
+  "EnFirstSurf": {
+    "value": 0,
+    "comment": "Enable first surface detection, other surfaces in the volume will be ignored"
+  },
+  "EnMaxUnderTsh": {
+    "value": 0,
+    "comment": "Enable max search under amplitude treshold active only if first surface enabled"
+  },
+  "EnDiffuseSurf": {
+    "value": 0,
+    "comment": "Enable detection of first treshhold crossing e.g. for diffuse surfaces"
+  },
+  "EnLastSurf": {
+    "value": 0,
+    "comment": "Enable clearing of results after consecutive crossing of treshhold value, last found surfface will be discarted and a new search begins"
+  },
+  "EnDeltaZ": {
+    "value": 0,
+    "comment": "Enable finding the delta Z of two peaks in the ascan"
+  },
+  "LutCtrl": {
+    "value": 0,
+    "comment": "00: idle, 01: Start writing LUT  00:, 10: start reading LUT 00: finished reading LUT"
+  },
+  "EnergyLutData": {
+    "value": 0,
+    "comment": "data wich is written or read to the energy function LUT"
+  },
+  "UndRelParam": {
+    "value": 192,
+    "comment": "Under relaxation parameter for minimize energy algo u(0.8)"
+  },
+  "ZRangeStart": {
+    "value": 0,
+    "comment": "Starting frame for energy function to be applied"
+  },
+  "ZRangeEnd": {
+    "value": 511,
+    "comment": "Last frame where the energy function is applied taken"
+  },
+  "MinEnergWin": {
+    "value": 16,
+    "comment": "Window for the minimize energy: Half range around the mean of the neighbors, limiting minimize energy. Value has to be a multiple of 8."
+  },
+  "ObsAddr": {
+    "value": 0,
+    "comment": "Address to select internal FPGA signals to be observed. Debugging feature."
+  },
+  "ObsData": {
+    "value": 0,
+    "comment": "Output for observed internal FPGA signals, live. (read-only, volatile register)"
+  },
+  "BistNum": {
+    "value": 0,
+    "comment": "0x10: Test ZTAG chain (encoder signals are generated internally. They emulate a motor with a 100nm encoder driving 5mm/s)"
+  },
+  "Seg1SensNFrames": {
+    "value": 100,
+    "comment": "N frames for segment 1"
+  },
+  "Seg2SensNFrames": {
+    "value": 1000,
+    "comment": "N frames for segment 2"
+  },
+  "Seg2SensMultiple": {
+    "value": 1,
+    "comment": "N frames for segment 2"
+  },
+  "IterCtrl": {
+    "value": 2,
+    "comment": "0: both disabled, 1: int enabled frac disabled, 2: int disabled frac enabled, 3:int enabled frac enabled"
+  },
+  "IterMaxInt": {
+    "value": 2,
+    "comment": "Maximum number of iterations done by the integer algorithm"
+  },
+  "IterMaxFrac": {
+    "value": 2,
+    "comment": "Maximum number of fractional done by the integer algorithm"
+  },
+  "StatSens": {
+    "value": 0,
+    "comment": "Go/NoGo for individual sensor quarters (read-onyl, volatile register)"
+  },
+  "StatMem": {
+    "value": 3,
+    "comment": "Status register containing no real data up to no (read-only, volatile register)"
+  },
+  "bcd_revision": {
+    "value": 369361921,
+    "comment": "BCD FPGA version code (read-only register)"
+  }
+}

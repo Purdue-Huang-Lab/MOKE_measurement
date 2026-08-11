@@ -87,7 +87,7 @@ class HeliCamC3(Device):
         "TrigFreeExtN":  1,     # 1=free-running (internal trigger), 0=external trigger
         "TrigExtSrcSel": 0,     # not in official register description; appears in SDK examples, always 0
         "CamMode":       4,     # 0=raw IQ, 1=amplitude, 2=smoothed amp, 3=intensity, 4=simple max, 5=ext-simple max, 7=min-energy
-        "AcqStop":       0,     # 0=acquisition running, 1=stopped (power-on default is 1)
+        "AcqStop":       1,     # 0=acquisition running, 1=stopped (power-on default is 1)
     }
 
     # Values below are the ones heliViewer used for a confirmed-good capture on
@@ -96,9 +96,9 @@ class HeliCamC3(Device):
     # (AcqStop=1), writes everything else, then restarts with this AcqStop=0.
     STEADY_SETTINGS = {
         "CamMode":         3,   # intensity mode — camera behaves like a standard 2D camera
-        "SensNFrames":   385,   # total frames; useful HDR output = SensNFrames - SensNDarkFrames - 3
+        "SensNFrames":   256,   # total frames; useful HDR output = SensNFrames - SensNDarkFrames - 3
         "SensNDarkFrames": 7,   # dark frames taken; must be >= 7 and <= SensNFrames - 4
-        "SensExpTime":     1,   # short exposure time [µs]; actual = SensExpTime * (SensExpTimeMult+1)
+        "SensExpTime":     2,   # short exposure time [µs]; actual = SensExpTime * (SensExpTimeMult+1)
         "SensExpTimeMult": 0,   # exposure time multiplier; actual exposure = SensExpTime * (SensExpTimeMult+1)
         "SensExpRatio":    3,   # short:long exposure ratio (register description §2.12); NOT frame-rate dead time
         "BSEnable":        0,   # must be 0 for intensity mode (manual §5.4)
@@ -135,12 +135,27 @@ class HeliCamC3(Device):
         # "steady" (SensNFrames=385) would silently inherit that leftover
         # value -- a 385-frame raw IQ volume instead of a small test
         # acquisition. Override via set_measurement_mode("rawIQ", SensNFrames=...).
-        "SensNFrames":   10,
+        "SensNFrames":   256,
+        # OffsetMethod does NOT apply to CamMode 0 (register description
+        # §2.18, OffsetProc's CamMode column is "1,2,4,5,7") -- rawIQ
+        # always returns raw, uncorrected ADC counts regardless of this
+        # register. Deliberately not set here -- see null_offset() for the
+        # actual CamMode-0 offset-correction path.
     }
 
     AMPLITUDE_SETTINGS = {
         "CamMode":       1,
+        # Same footgun as RAWIQ_SETTINGS: without an explicit default,
+        # switching into amplitude mode after "steady" (SensNFrames=256)
+        # would silently inherit whatever was last set.
+        "SensNFrames":   256,
         "OffsetMethod":  0,
+    }
+
+    SMOOTH_AMPLITUDE_SETTINGS = {
+        "CamMode":       2,
+        "SensNFrames":   256,
+        "FWHMnFrame":    2      # FWHM for signal envelope. 0 - no filter; 1 - 2 frame; 2 - 6 frames, 3 - 10, 4 - 20
     }
 
     # --- Physical / calibration constants, used by estimate_acquire_time() ---
@@ -211,7 +226,9 @@ class HeliCamC3(Device):
     _MODE_TO_FMT = {
         0: "DF_I16Q16",   # raw IQ
         1: "DF_A16",      # amplitude volume
-        3: "DF_I16Q16",   # intensity (IQ raw used, summed in post) -- see NOTE above
+        2: "DF_A16",      # smoothed amplitude volume -- same format as mode 1,
+                           # just FWHMnFrame-filtered on-device (manual §5.2.2)
+        3: "DF_I16Q16",   # intensity (IQ raw used, short channel reported) -- see NOTE above
         4: "DF_A16Z16",   # simple max  → surface (Z) + amplitude (A)
         5: "DF_Z16A16P16",# extended simple max → Z, A, phase
         7: "DF_A16Z16",   # minimize energy
@@ -295,6 +312,8 @@ class HeliCamC3(Device):
             _log.warning("close() called but camera is not open")
             return 0
         _log.debug("Closing camera")
+        # stop acquisition first
+        self.set_attributes(AcqStop=1)
         res = self._lib.Close()
         self._is_open = False
         _log.info("Camera closed (res=%d)", res)
@@ -476,10 +495,10 @@ class HeliCamC3(Device):
 
     def get_image_shape(self) -> tuple[int, int]:
         """
-        Get the expected shape of the image returned by acquire_single()
-        (i.e. after crop_unphysical() has removed the border test pixels --
-        data_reformat() alone, called on uncropped data, would still be the
-        full SENSOR_HEIGHT x SENSOR_WIDTH).
+        Get the expected (height, width) of the image returned by
+        acquire_single() / data_reformat() -- both crop the sensor's
+        non-photodiode border test pixels (crop_unphysical()) down to this
+        size before returning.
 
         Returns
         -------
@@ -534,7 +553,7 @@ class HeliCamC3(Device):
     #     """
     #     pass
 
-    def set_measurement_mode(self, modedesc, **kwargs):
+    def set_measurement_mode(self, modedesc, warmup: bool = True, **kwargs):
         """
         Helper function to prepare camera measurement mode.
         Argument:
@@ -543,8 +562,26 @@ class HeliCamC3(Device):
             Allow
             "steady" / "intensity": intensity mode — camera behaves like a standard 2D camera
             "rawIQ" / "raw_iq": raw IQ mode — returns signed I/Q volume per frame
+            "amplitude" / "amp": amplitude mode — lock-in amplitude volume, computed on-device
+            "smooth_amplitude" / "smoothAmp": amplitude mode with an on-device
+                FWHMnFrame-length matched filter applied (manual §5.2.2)
             "minimum_energy" / "minE": minimize-energy surface mode
             To-be-filled
+        - warmup: bool, default True.
+            The first acquisition right after a mode switch has been
+            confirmed on real hardware to carry a settling artifact --
+            weak/absent real signal, elevated flat noise -- that clears up
+            by the next acquisition, regardless of what registers are
+            touched in between (see
+            archive/helicam_document/helicamC3_practical_knowledge_base.md
+            for the mode1-sweep-vs-mode2-steady comparison this was found
+            with). When True (default), this method triggers and discards
+            one throwaway acquisition itself, right after switching modes,
+            so every caller gets a settled sensor for free without having
+            to know about this. Costs one full extra acquisition's worth of
+            time (can be several seconds for volume modes) -- set False to
+            opt out, e.g. in a loop that calls this repeatedly and wants to
+            manage warm-up itself (or accepts the risk for speed).
         - **kwargs:
             Override any mode-specific setting, e.g. SensNFrames=100.
         """
@@ -553,6 +590,8 @@ class HeliCamC3(Device):
         intensity_alias = ["intensity", "steady"]
         minimum_energy_alias = ["minimum_energy", "minE"]
         rawIQ_alias = ["rawIQ", "raw_iq"]
+        amplitude_alias = ["amplitude", "amp"]
+        smooth_amplitude_alias = ["smooth_amplitude", "smoothAmp"]
 
         if modedesc in intensity_alias:
             base = dict(self.STEADY_SETTINGS)
@@ -563,6 +602,12 @@ class HeliCamC3(Device):
         elif modedesc in rawIQ_alias:
             base = dict(self.RAWIQ_SETTINGS)
             cam_mode = 0
+        elif modedesc in amplitude_alias:
+            base = dict(self.AMPLITUDE_SETTINGS)
+            cam_mode = 1
+        elif modedesc in smooth_amplitude_alias:
+            base = dict(self.SMOOTH_AMPLITUDE_SETTINGS)
+            cam_mode = 2
         else:
             raise ValueError(f"Unsupported measurement mode: {modedesc}")
 
@@ -578,6 +623,11 @@ class HeliCamC3(Device):
         self._lib.AllocCamData(1, fmt, 0, 0, 0)
         self._current_cammode = cam_mode
         _log.info("Prepared mode '%s' (CamMode=%d)", modedesc, cam_mode)
+
+        if warmup:
+            self.flush()
+            self._acquire()
+            _log.info("set_measurement_mode('%s'): discarded 1 warm-up acquisition", modedesc)
 
     def compare_steady_settings_to_gui_reference(self) -> dict:
         """
@@ -747,6 +797,8 @@ class HeliCamC3(Device):
         acquisition, leaving the centered SENSOR_HEIGHT_USABLE x
         SENSOR_WIDTH_USABLE pixels.
 
+        NOTE: NEED DOUBLE CHECK: seem to only need in steady state measurement, and is already cropped in lock-in mode.  
+
         Locates the sensor's H=300, W=300 axes by shape -- works for both
         the ``(n_frames, 300, 300, [channels])`` volume-mode layout and the
         ``(300, 300, channels)`` surface-mode layout -- and slices them down
@@ -787,8 +839,8 @@ class HeliCamC3(Device):
         """
         Helper function to acquire a single frame and return it as a numpy array.
 
-        Crops the sensor's non-photodiode border rows/columns
-        (``crop_unphysical()``) before ``data_reformat()`` -- both so no
+        ``data_reformat()`` crops the sensor's non-photodiode border
+        rows/columns (``crop_unphysical()``) itself -- both so no
         downstream statistic (max/percentile/etc.) is ever computed over
         border pixels, and so the dark-frame baseline in CamMode 3 isn't
         itself skewed by border pixels that clip against 0/1023.
@@ -798,15 +850,14 @@ class HeliCamC3(Device):
         data = self._acquire()
         if data is None:
             return None
-        data = self.crop_unphysical(data)
         return self.data_reformat(data)
 
     def acquire_avg(self, n_frames: int = 10):
         """
         Acquire multiple frames in a loop and return their average.
 
-        Crops the sensor's non-photodiode border rows/columns
-        (``crop_unphysical()``) before ``data_reformat()``, same as
+        ``data_reformat()`` crops the sensor's non-photodiode border
+        rows/columns (``crop_unphysical()``) itself, same as
         ``acquire_single()``.
         """
         self._require_open("continuous_acquire")
@@ -818,7 +869,6 @@ class HeliCamC3(Device):
             data = self._acquire()
             if data is None:
                 continue
-            data = self.crop_unphysical(data)
             np_data = self.data_reformat(data)
             if acc is None:
                 acc = np_data.astype(np.float64)
@@ -828,6 +878,63 @@ class HeliCamC3(Device):
         if count == 0:
             return None
         return acc / count
+
+    def null_offset(self, n_acquisitions: int = 10) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Measure the real per-pixel I/Q offset in rawIQ mode (CamMode 0) by
+        averaging several acquisitions.
+
+        CamMode 0 returns raw, uncorrected ADC counts (manual §5.1) --
+        unlike CamModes 1/2/4/5/7, the on-device ``OffsetMethod`` offset
+        computation does not apply to it (register description §2.18,
+        ``OffsetProc``'s CamMode column is "1,2,4,5,7" -- CamMode 0 is
+        excluded). This is the CamMode-0 equivalent: call it with **no
+        modulated signal present** (light source blocked, or demod
+        frequency detuned) to measure the camera's actual per-pixel I/Q
+        baseline, then pass the result to ``iq_to_amp_phase()`` as
+        ``offset_I``/``offset_Q`` instead of the manual's rough nominal 512
+        -- which this driver has measured as off by tens of counts per
+        channel on this camera (see
+        archive/helicam_document/helicamC3_practical_knowledge_base.md).
+
+        Thin wrapper around ``acquire_avg()`` (same crop/frame-average
+        pipeline as ``acquire_single()``), just splitting the returned
+        ``(H, W, 2)`` array back into its I/Q channels.
+
+        Requires CamMode 0 already set via ``set_measurement_mode('rawIQ')``.
+
+        Parameters
+        ----------
+        n_acquisitions:
+            Number of acquisitions to average. Each acquisition is already
+            an average over ``SensNFrames`` raw frames (``data_reformat()``),
+            so this is an *outer* average on top of that -- mainly useful
+            for beating down acquisition-to-acquisition noise.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            ``(offset_I, offset_Q)``, each ``(H, W)`` float64 -- per-pixel
+            means, suitable for direct use as ``iq_to_amp_phase()``'s
+            ``offset_I``/``offset_Q`` (which broadcast fine against either
+            a scalar or a same-shaped array).
+
+        Raises
+        ------
+        RuntimeError
+            If the camera is not open, not in rawIQ mode, or every
+            acquisition in the average failed.
+        """
+        self._require_open("null_offset")
+        if getattr(self, "_current_cammode", None) != 0:
+            raise RuntimeError(
+                "null_offset: camera must be in rawIQ mode -- "
+                "call set_measurement_mode('rawIQ') first"
+            )
+        avg = self.acquire_avg(n_acquisitions)
+        if avg is None:
+            raise RuntimeError("null_offset: all acquisitions failed")
+        return avg[..., 0], avg[..., 1]
 
     def save_raw_np(self, out_dir: str, name: str = "raw", mode: int = None) -> str:
         """
@@ -1122,7 +1229,7 @@ class HeliCamC3(Device):
         px = self.SENSOR_HEIGHT * self.SENSOR_WIDTH
         if cam_mode in (0, 3):        # DF_I16Q16  — full I/Q volume
             return n_frames * px * 2 * 2
-        if cam_mode == 1:             # DF_A16     — amplitude volume
+        if cam_mode in (1, 2):        # DF_A16     — amplitude / smoothed amplitude volume
             return n_frames * px * 2
         if cam_mode in (4, 7):        # DF_A16Z16  — collapsed surface
             return px * 2 * 2
@@ -1328,9 +1435,9 @@ class HeliCamC3(Device):
         """
         Dark-subtract and frame-average a raw CamMode-3 acquisition,
         keeping channel 0 (long exposure) and channel 1 (short exposure)
-        separate. Shared by ``data_reformat()`` (which then sums the two
-        channels together) and ``auto_expose()`` (which needs them kept
-        apart to compare their magnitudes).
+        separate. Shared by ``data_reformat()`` (which reports channel 1
+        only -- see its docstring for why) and ``auto_expose()`` (which
+        needs both kept apart to compare their magnitudes).
 
         BSEnable=0 is mandatory in intensity mode (manual §5.4), so the
         hardware doesn't suppress the per-pixel baseline itself -- the
@@ -1374,11 +1481,20 @@ class HeliCamC3(Device):
         arr = data.view(np.int16).astype(np.float64)   # (n_frames, H, W, 2)
         dark_ref = arr[:n_dark].mean(axis=0)            # (H, W, 2)
         return arr[n_dark:].mean(axis=0) - dark_ref     # (H, W, 2)
+    
     def data_reformat(self, data, mode=None):
         """
-        Post-process raw acquire() output into a spatially meaningful array.
+        Post-process raw acquire() output into a ready-to-plot image.
 
-        The behaviour depends on the CamMode set by the most recent call to
+        Only CamMode 0 (raw IQ) and 3 (intensity) return the full raw
+        300x300 sensor frame, so only those two get cropped here
+        (``crop_unphysical()``, down to SENSOR_HEIGHT_USABLE x
+        SENSOR_WIDTH_USABLE = 292 x 280). Every other CamMode is already
+        pre-cropped by the FPGA to its own native size before this driver
+        ever sees it (confirmed via the SDK's own metadata, see the
+        per-CamMode shapes below) -- cropping those again would raise
+        (there's no 300x300 axis pair left to find). The behaviour depends
+        on the CamMode set by the most recent call to
         ``prepare_measurement_mode()`` (stored in ``self._current_cammode``).
 
         Parameters
@@ -1389,51 +1505,93 @@ class HeliCamC3(Device):
         Returns
         -------
         np.ndarray
-            * **CamMode 3 – intensity**: 2D float64 (300 × 300). The first
+            * **CamMode 3 – intensity**: 2D float64 (292 × 280). The first
               ``SensNDarkFrames`` frames are averaged into a per-pixel
               baseline and subtracted from the remaining frames (BSEnable=0
               in intensity mode means the hardware doesn't do this itself);
               the remaining frames are then averaged (not summed --
               SensNFrames is purely a noise-averaging knob here, not a
-              light-budget one) and their I/Q channels summed to yield a
-              baseline-subtracted intensity image, scaled to the sensor's
-              native per-frame ADC range independent of SensNFrames.
-            * **CamMode 0 – raw IQ**: int16 volume (n_frames × 300 × 300 × 2),
-              unscaled raw ADC counts (0-1023 nominal range) — use
-              ``iq_to_amplitude()`` to convert to physical amplitude.
-            * **CamMode 1 – amplitude**: float32 (300 × 300), physical amplitude
-              (register description §5.2.1: u12.4 fixed-point → divide by 16).
-            * **CamMode 4, 7 – surface**: float32 (H × W × 2); channel 0 = amplitude
-              (u12.4 → /16), channel 1 = Z-height (u11.5 → /32), per register
-              description §5.3.1.
+              light-budget one). Reports **channel 1 (short exposure) only**
+              -- not a combination of both HDR channels -- so the reported
+              intensity is a faithful, unambiguous reading of the detector
+              at exactly the requested ``t_acquire_us`` (``SensExpTime``),
+              consistent with how CamMode 0 (rawIQ) works, and independent
+              of whatever ``SensExpRatio`` happens to be set. Channel 0
+              (long exposure) is still measured on every acquisition (it's
+              part of the same HDR pair) but discarded here -- it remains
+              available via ``_dark_subtract_channels()`` directly, which
+              is what ``auto_expose()`` uses for its saturation detection
+              (channel 0 clips well before channel 1, giving early warning
+              margin -- see its docstring).
+            * **CamMode 0 – raw IQ**: float64 (292 × 280 × 2); channel 0 = I,
+              channel 1 = Q, averaged over the acquired frame volume
+              (unscaled raw ADC counts, ~512 nominal baseline per manual
+              §5.1) — plot either channel directly, or pass both to
+              ``iq_to_amplitude()`` for a lock-in amplitude image.
+            * **CamMode 1, 2 – amplitude, smoothed amplitude**: float32
+              **(292 × 282)** -- not cropped, this is the FPGA's own native
+              output size for DF_A16 (programmer manual, ``metadata->dimSz``
+              -- larger than SENSOR_HEIGHT_USABLE/WIDTH_USABLE, and not
+              explained anywhere in the available docs). Physical amplitude
+              (register description §5.2.1/§5.2.2: u12.4 fixed-point →
+              divide by 16), averaged over the acquired frame volume
+              (programmer manual: DF_A16 is a ``(SensNFrames, H, W)`` stack,
+              not a single surface). Mode 2 differs only in applying an
+              on-device FWHMnFrame-length matched filter before this point.
+            * **CamMode 4, 7 – surface**: float32 **(293 × 281 × 2)** -- also
+              not cropped, the FPGA's own native size for DF_A16Z16
+              (programmer manual), yet another value, undocumented as to
+              why. Channel 0 = amplitude (u12.4 → /16), channel 1 =
+              Z-height (u11.5 → /32), per register description §5.3.1.
 
         Raises
         ------
         NotImplementedError
-            For CamMode 2/5/6 (smoothed amplitude, extended simple max,
-            reserved) — none are reachable via ``set_measurement_mode()``
-            today, and returning their raw fixed-point ints unscaled would be
-            silently wrong rather than merely unimplemented (see
+            For CamMode 5/6 (extended simple max, reserved) — neither is
+            reachable via ``set_measurement_mode()`` today, and returning
+            their raw fixed-point ints unscaled would be silently wrong
+            rather than merely unimplemented (see
             device_interface_instruction.md §2).
         """
         cam_mode = mode if mode is not None else getattr(self, '_current_cammode', None)
         if cam_mode is None and self._is_open:
             cam_mode = self.get_attribute('CamMode')
 
+        # Only CamMode 0 (raw IQ) and 3 (intensity) return the full raw
+        # 300x300 sensor frame -- crop_unphysical() applies there. Every
+        # other CamMode is already pre-cropped by the FPGA to its own
+        # native size before this driver ever sees it (confirmed via the
+        # SDK's own metadata->dimSz, heliSDK_programmer-manual_v1_2.md):
+        # CamMode 1/2 (amplitude) -> 292x282, CamMode 4/7 (surface) ->
+        # 293x281, CamMode 5 -> 292x280 (this one happens to already match
+        # SENSOR_HEIGHT_USABLE/WIDTH_USABLE, purely by coincidence). None
+        # of those match SENSOR_HEIGHT/SENSOR_WIDTH (300, 300), so calling
+        # crop_unphysical() on them raises ValueError -- don't.
+        if cam_mode in (0, 3):
+            data = self.crop_unphysical(data)
+
         if cam_mode == 3:
-            # Channel 0 (long exposure) + channel 1 (short exposure) summed
-            # -- see _dark_subtract_channels() for the dark-baseline
-            # subtraction and frame-averaging this builds on.
-            channels = self._dark_subtract_channels(data)   # (300, 300, 2): [long, short]
-            return channels.sum(axis=-1)   # (300, 300) float64, baseline-subtracted
+            # Report channel 1 (short exposure) only -- see the docstring
+            # above for why not a combination of both HDR channels. Channel
+            # 0 (long exposure) is still measured and dark-subtracted here
+            # (it's part of the same acquisition), just not returned.
+            channels = self._dark_subtract_channels(data)   # (292, 280, 2): [long, short]
+            return channels[..., 1]   # (292, 280) float64, baseline-subtracted, short exposure
 
         elif cam_mode == 0:
-            # Raw IQ — return signed volume unchanged, still raw ADC counts.
-            return data.view(np.int16)
+            # Raw IQ -- reinterpret as signed, average over the frame volume.
+            # No dark-frame concept here (that's CamMode 3's SensNDarkFrames);
+            # iq_to_amplitude()'s offset_I/offset_Q handle the ~512 baseline.
+            arr = data.view(np.int16).astype(np.float64)   # (n_frames, 292, 280, 2)
+            return arr.mean(axis=0)   # (292, 280, 2) float64: [..., 0]=I, [..., 1]=Q
 
-        elif cam_mode == 1:
-            # Amplitude volume: u12.4 fixed-point (register description §5.2.1).
-            return data.astype(np.float32) / 16.0
+        elif cam_mode in (1, 2):
+            # Amplitude / smoothed amplitude: DF_A16, u12.4 fixed-point
+            # (register description §5.2.1/§5.2.2). Programmer manual:
+            # DF_A16 is a (SensNFrames, H, W) amplitude volume, not a
+            # single surface -- average over frames for a ready-to-plot
+            # image, same as CamMode 0.
+            return (data.astype(np.float32) / 16.0).mean(axis=0)
 
         elif cam_mode in (4, 7):
             # Surface modes: amplitude u12.4 (/16), Z u11.5 (/32) -- §5.3.1.
@@ -1445,13 +1603,13 @@ class HeliCamC3(Device):
         else:
             raise NotImplementedError(
                 f"data_reformat(): CamMode {cam_mode} has no documented conversion "
-                f"implemented (only 0, 1, 3, 4, 7 are)"
+                f"implemented (only 0, 1, 2, 3, 4, 7 are)"
             )
 
     @staticmethod
-    def iq_to_amplitude(I, Q, offset_I: float = 512.0, offset_Q: float = 512.0) -> np.ndarray:
+    def iq_to_amp_phase(I, Q, offset_I: float = 512.0, offset_Q: float = 512.0) -> tuple[np.ndarray, np.ndarray]:
         """
-        Convert raw I/Q samples into a lock-in amplitude image.
+        Convert raw I/Q samples into a lock-in amplitude image and phase image.
 
         Implements the manual's raw-IQ formula (§5.1)::
 
@@ -1462,20 +1620,23 @@ class HeliCamC3(Device):
         Parameters
         ----------
         I, Q:
-            Raw in-phase/quadrature arrays (e.g. from ``read_frame()`` or a
-            slice of a CamMode-0 ``data_reformat()`` volume).
+            Raw in-phase/quadrature arrays (e.g. from ``read_frame()``, or
+            ``data_reformat(data, mode=0)[..., 0]`` / ``[..., 1]``).
         offset_I, offset_Q:
-            Per-channel DC offset to subtract before combining. Default to
-            512 -- the manual's documented nominal ADC center for a
-            non-modulated signal ("a non-modulated signal corresponds to a
-            value around 512, not 0"). Pass the real per-pixel values once a
-            calibration routine (``null_offset()``, not yet built) supplies
-            them.
+            Per-channel DC offset to subtract before combining -- either a
+            scalar or a per-pixel array broadcastable against ``I``/``Q``.
+            Default to 512 -- the manual's documented nominal ADC center for
+            a non-modulated signal ("a non-modulated signal corresponds to
+            a value around 512, not 0"), but measured off by tens of counts
+            per channel on this camera -- prefer real values from
+            ``null_offset()`` (dedicated no-signal calibration, per-pixel)
+            or at minimum ``I.mean()``/``Q.mean()`` (same-frame scalar
+            estimate, no extra acquisition) over this default.
 
         Returns
         -------
-        np.ndarray
-            Amplitude, same shape as ``I``/``Q``, float64.
+        Tuple[np.ndarray, np.ndarray]
+            Amplitude and phase, same shape as ``I``/``Q``, float64.
 
         Notes
         -----
@@ -1484,7 +1645,21 @@ class HeliCamC3(Device):
         """
         Ic = I.astype(np.float64) - offset_I
         Qc = Q.astype(np.float64) - offset_Q
-        return np.sqrt(Ic**2 + Qc**2)
+        amplitude = np.sqrt(Ic**2 + Qc**2)
+        phase = np.arctan2(Qc, Ic)
+        return amplitude, phase
 
+    # ----- 8 Super-task -----
+    # methods that are self-contained enough. Probably not really suitable for this class, but kept for convenience
+    def measure_steady_state(self, n_frames: int = 256, t_expose_us: float = 10):
+        """
+        Measure steady state intensity map.
+        """
+        self.set_measurement_mode("steady")
+        self.set_acquire_time(t_expose_us)
+        self.set_attributes(SensNFrames=n_frames)
+        data = self.acquire_single()
+        return data
+    # --------------------------------------------------
 if __name__ == "__main__":
     print("This module is intended to be imported, not run directly.")

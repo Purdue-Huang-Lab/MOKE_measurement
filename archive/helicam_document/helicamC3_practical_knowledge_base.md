@@ -47,6 +47,32 @@ not cropped: `save_raw_np()`, deliberately — it exists to preserve the
 fully raw, untouched array, border pixels included, for later
 reprocessing.
 
+**Correction (2026-08-11): this crop only applies to CamMode 0 and 3.**
+Only those two return the full raw 300×300 sensor frame. Every other
+CamMode is already pre-cropped by the FPGA itself, to its own native size,
+before this driver ever sees it — confirmed via the SDK's own
+`metadata->dimSz` (`heliSDK_programmer-manual_v1_2.md`'s per-CamMode code
+snippets):
+
+| CamMode | reported size (rows × cols) | note |
+|---|---|---|
+| 0 (raw IQ) | 300 × 300 | full raw frame — `crop_unphysical()` applies |
+| 3 (intensity) | 300 × 300 | full raw frame — `crop_unphysical()` applies |
+| 1, 2 (amplitude / smoothed) | **292 × 282** | FPGA-native, not cropped |
+| 4, 7 (surface) | **293 × 281** | FPGA-native, not cropped |
+| 5 (extended simple max) | 292 × 280 | FPGA-native, coincidentally matches |
+
+None of the CamMode-1/2/4/7/5 sizes are explained anywhere in the manual,
+register description, programmer's manual, or the live `SysDesc.xml`
+(`C:\ProgramData\Heliotis\devDesc\SysDesc.xml`, which only declares the
+raw sensor's `size="300 300"`) — best guess (unconfirmed): the on-chip
+amplitude/peak-finding algorithms have their own edge-handling behavior,
+distinct from the raw sensor's fixed test-pixel border convention.
+`data_reformat()` was briefly, incorrectly changed to crop every mode
+uniformly, which crashed CamMode 1/2 (`ValueError: no axis pair of shape
+(300, 300) found in array shape (256, 292, 282)`) — reverted; it now only
+calls `crop_unphysical()` when `cam_mode in (0, 3)`.
+
 ---
 
 ## 2. Raw I/Q values sit on a ~512 baseline, not 0 — real dynamic range is roughly halved
@@ -138,16 +164,32 @@ time than channel 1 (short exposure).
 **Now reflected in code:** `HeliCamC3.SENSEXPRATIO_SHORT_LONG` (`{0:2, 1:4,
 2:8, 3:16}`) records the ratio table and the channel-0=long/channel-1=short
 mapping, used by the rewritten `auto_expose()` (§5). `data_reformat()`'s
-CamMode-3 branch still combines the two channels via
-`_dark_subtract_channels(data).sum(axis=-1)` — i.e. it still adds the
-short- and long-exposure channels together as if they were
-equivalent/redundant quantities. Per the above, they are not: they're two
-different-duration exposures of the same scene, intended (per the manual's
-"HDR" framing) to be combined as a proper HDR merge (favor the
-long-exposure pixel unless saturated, fall back to a scaled short-exposure
-pixel otherwise) — not summed directly. This part is flagged but **not
-fixed** yet; see `open_issue_helicam.md` #3 for the related
-`DF_Hf`-vs-`DF_I16Q16` divergence this ties into.
+CamMode-3 branch used to combine the two channels via
+`_dark_subtract_channels(data).sum(axis=-1)` — summing the short- and
+long-exposure channels together as if they were equivalent/redundant
+quantities, which they're not (two different-duration exposures of the
+same scene). This was changed (2026-08-11) to report **channel 1 (short
+exposure) only** — `_dark_subtract_channels(data)[..., 1]` — instead of a
+real HDR merge or a sum: the driving requirement is that steady-state's
+reported intensity be a faithful, unambiguous reading of the detector at
+exactly the requested `t_acquire_us`, matching how CamMode 0 (rawIQ)
+already works (its exposure is set directly by `SensExpTime`, no ratio
+involved). Summing both channels made the reported brightness depend
+heavily on `SensExpRatio` — confirmed concretely: the same `t_acquire_us`
+gave very different steady-frame quality between `mode1_lifecycle()`
+(`SensExpRatio=3`, i.e. channel 0 really integrates 16× `SensExpTime`) and
+`mode2_lockin()` (`SensExpRatio=1`, only 4×), because the sum was
+dominated by whichever channel had more real integration time, not by
+what the caller actually requested. Channel 0 is still measured and
+dark-subtracted on every acquisition (same HDR pair), just not returned
+by `data_reformat()` -- it remains available via `_dark_subtract_channels()`
+directly, which is what `auto_expose()` still uses for saturation
+detection. **Not yet tested against hardware.** A real HDR merge (favor
+long unless saturated, fall back to scaled short) remains a possible
+future direction if steady-state's dynamic range at low light turns out
+to matter more than the simplicity of this fix -- see
+`open_issue_helicam.md` #3 for the related `DF_Hf`-vs-`DF_I16Q16`
+divergence this ties into.
 
 ---
 
@@ -267,11 +309,113 @@ before/after their `auto_expose()` call.
 
 ---
 
+## 8. Mode-switch settling artifact — `set_measurement_mode()` now warms up by default
+
+The first acquisition right after any mode switch carries a settling
+artifact: weak/absent real signal, elevated flat noise, that clears up by
+the next acquisition regardless of what registers are touched in between.
+
+Found (2026-08-11) while chasing why `mode2_lockin()`'s steady frame still
+looked much worse than `mode1_lifecycle()`'s sweep even after fixing the
+CamMode-3 channel-summing issue (§4) — `SensExpRatio` turned out not to be
+the (whole) explanation. The deciding comparison: `mode1_lifecycle()`'s
+own **first** acquisition (`t=1us`, right after its one `set_measurement_
+mode('steady')` call) has nearly identical statistics to `mode2_lockin()`'s
+steady frame (top/bottom-half std ~5.0-5.2 in both, row-mean-std ~0.1 in
+both — i.e. no detectable real spatial signal, just flat noise), while
+`mode1_lifecycle()`'s **later** sweep steps (e.g. `t=16us`, 5 acquisitions
+into the same loop, no further mode switch) show a strong, clearly real
+localized feature (row-mean-std 2.6, 23× higher). Mode 1's sweep only
+looks good because each step after the first benefits from the prior
+steps' accumulated settling time — mode 2 never gets that, since it only
+ever takes one shot right after switching modes.
+
+Confirmed by direct experiment: acquiring twice in a row right after a
+mode switch and discarding the first, the second was *always* better,
+regardless of what was changed between the two acquisitions
+(`set_attributes()`, `set_measurement_mode()` again, `flush()` — none of
+it mattered, only "one more real acquisition since the mode switch" did).
+
+**Fix:** `set_measurement_mode()` now triggers and discards one throwaway
+acquisition itself, right after switching modes — new `warmup: bool =
+True` parameter, on by default, `warmup=False` to opt out. Applied
+uniformly to every mode (steady, rawIQ, amplitude, smooth_amplitude,
+minE) since the cause (settling after a mode switch, not a CamMode-3-
+specific effect) isn't mode-specific — mode 1's sweep just happened to be
+the one place this was ever measurable, since it's the only test mode
+that does several acquisitions in a row without switching modes in
+between. **Not yet tested against hardware.**
+
+Cost: one extra full acquisition per `set_measurement_mode()` call
+(several seconds for volume modes at `SensNFrames=256`). Modes 5 and 6
+call it in a sweep loop (10 and 4 iterations respectively) — this roughly
+doubles their runtime. Left as the default there too for now; pass
+`warmup=False` per-call if that becomes a problem.
+
+---
+
+## 9. Steady-state and amplitude images DO show the same real feature — aligned at (row+0, col+1)
+
+Confirmed (2026-08-11, `helicam_test_data/260811-lockin mode-2`) that
+`mode2_steady_frame.npy` (CamMode 3, 292×280) and `mode2_amplitude_frame.npy`
+/ `mode2_smooth_amplitude_frame.npy` (CamMode 1/2, 292×282 — see §1's
+per-CamMode size table) capture the same real spatial feature, offset by
+almost exactly what you'd expect from the width difference alone: amp's
+frame is 2 columns wider than steady's, and a symmetric center-crop
+naturally shifts its content by 1 column relative to steady's. No row
+offset.
+
+**How this was actually found — two naive approaches failed first:**
+- **Whole-image pixel correlation** between steady and amp came out near
+  zero regardless of row/col offset tried. Cause: most of a 292×280 frame
+  is background/noise with nothing in common between the two images: a
+  small, real, localized feature gets diluted into insignificance when
+  every background pixel is weighted equally in the correlation.
+- **Whole-image center-of-mass** (background-subtracted, weighted
+  centroid) worked well on the steady frame (its blob has high contrast:
+  std 4.2 against a well-defined localized peak) but landed **~36 rows
+  off** on the amplitude frame — amp's real signal is weak (mean 2.08,
+  std only 0.30), so the background-subtracted "mass" is dominated by
+  random noise fluctuations elsewhere in the frame, not the real feature.
+
+**What worked:** anchor to the *confident* location — steady's
+high-contrast blob center, found via its own (reliable) center-of-mass —
+then search a small local window in the *other* image around that same
+location for the offset that maximizes correlation, instead of trusting
+either image's independent whole-frame statistic. Under that search, the
+best alignment is `(row_offset=0, col_offset=+1)`, with:
+- **Local-window correlation ≈ 0.87** (both amplitude and
+  smooth_amplitude) — a strong, unambiguous match once restricted to the
+  region that actually contains signal.
+- **Full-frame correlation ≈ 0.33-0.34** — real and clearly non-trivial
+  (nothing like the ~0 from the naive whole-image attempt above), just
+  diluted by the large fraction of the frame that's background/noise in
+  both images.
+
+**Lesson for any future cross-CamMode spatial comparison:** don't trust
+whole-image correlation or center-of-mass alone when one side has a weak
+signal-to-noise ratio — anchor to whichever image gives the more
+confident/high-contrast localization first, then search locally in the
+other.
+
+**Not yet cross-checked** against the *other*, earlier capture
+(`260811-lockin mode`, no `-2` suffix) that originally motivated this
+investigation — that one's whole-image correlation was checked with the
+same (now known to be unreliable at full-frame scale) naive method and
+came back ~0. Unknown whether it would also show the same real local
+alignment under this improved method, or whether that particular capture
+genuinely had no real modulated signal (e.g. `set_demod_clock()` still
+being unimplemented per `open_issue_helicam.md` #2 remains a real
+possibility for *some* captures, just not this one).
+
+---
+
 ## Open questions (not yet resolved)
 
-- Should `data_reformat()`'s CamMode-3 reduction do a real HDR merge
-  (long-exposure pixel unless saturated, else scaled short) instead of
-  summing the two channels? (§3)
+- Now that CamMode-3 reports channel 1 (short exposure) only instead of
+  summing (§3), is that the right long-term choice, or should it become a
+  real HDR merge (long-exposure pixel unless saturated, else scaled
+  short) once low-light dynamic range matters more than simplicity?
 - `SensNavM2`/`SensTqp` gap in `STEADY_SETTINGS` (§6) — apply and re-test?
 - `auto_expose()`'s remaining bug (§5) — no pipeline resync after an
   acquisition timeout, still open in the rewritten version too.

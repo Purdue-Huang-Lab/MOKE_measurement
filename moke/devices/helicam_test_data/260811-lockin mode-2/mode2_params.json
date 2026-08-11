@@ -1,0 +1,8 @@
+{
+  "t_acquire_us": 10.0,
+  "gain_DdsGain": 2,
+  "FWHMnFrame": 2,
+  "offset_method": "self",
+  "offset_I_mean": 599.8692542387781,
+  "offset_Q_mean": 578.5748484990368
+}
