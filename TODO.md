@@ -15,10 +15,39 @@ Background reading, in order of how foundational they are:
 
 ---
 
-## 1. Needs a hardware run — the `auto_expose()` rewrite
+## 1. Needs a hardware run — `auto_expose()` min-trials refinement
+
+`HeliCamC3.auto_expose()` in `moke/devices/helicam.py` got one real
+hardware test after being rewritten (see below), which surfaced two things:
+
+- Starting `SensExpRatio` at 3 (nominal ratio 16) was too aggressive —
+  switched to `SensExpRatio=1` (nominal ratio 4) and `SensNFrames=256`,
+  both now hardcoded at the top of `auto_expose()`.
+- The ratio measurement was noisy right around the saturation boundary,
+  so a single trial could falsely flag saturation (or fail to).
+
+**Fix applied (untested):** a new `min_trials=3` parameter. The
+floor-limited check no longer trusts a single deviating read at
+`t_min_us` — it confirms with up to 2 more (larger) trials before
+concluding the exposure can't be reduced further, since saturation only
+grows with more exposure time. Same idea for the bisection phase: it now
+keeps refining past its tolerance target until at least `min_trials` total
+measurements have been taken, instead of possibly settling on the
+saturation onset from just 2 points. **Neither change has been run against
+the camera** — worth specifically checking that `min_trials=3` isn't
+adding too many extra acquisitions (each trial is a real camera timing
+cost) and that the floor-limited confirmation logic behaves sanely if it
+really is floor-limited (i.e. doesn't spuriously "recover" and search
+upward when it shouldn't).
+
+---
+
+## 1b. Needs a hardware run — the `auto_expose()` rewrite (original)
 
 `HeliCamC3.auto_expose()` in `moke/devices/helicam.py` was completely
-rewritten this session and **has never been run against the camera**.
+rewritten this session — the ratio-based design below **was** run once
+against hardware (see §1 above for the resulting tweaks), but only in
+its original form, not with the min-trials refinement.
 
 **What it does now:** instead of comparing summed intensity against a
 theoretical (and, per the knowledge base §2, actually wrong)

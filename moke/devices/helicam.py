@@ -676,7 +676,7 @@ class HeliCamC3(Device):
         self.set_attributes(SensTqp=SensTqp)
         _log.info("Set demodulation frequency to %.1f Hz (SensTqp=%d)", freq, SensTqp)
 
-    def flush(self, max_frames: int = 3) -> int:
+    def flush(self, max_frames: int = 1) -> int:
         """
         Drain stale frames from the USB buffer.
 
@@ -879,11 +879,12 @@ class HeliCamC3(Device):
 
     def auto_expose(
         self,
-        target_fraction: float = 0.5,
-        t_min_us: float = 1.0,
-        t_max_us: float = 16380.0,
-        ratio_tol: float = 0.1,
-        max_iter: int = 20,
+        target_fraction: float = 0.25,
+        t_min_us: float = 2.0,
+        t_max_us: float = 1024.0,
+        ratio_tol: float = 0.2,
+        max_iter: int = 10,
+        min_trials: int = 3,
     ) -> dict:
         """
         Find the short-exposure time that puts channel 0 (the long-exposure
@@ -931,6 +932,13 @@ class HeliCamC3(Device):
             ratio that counts as "channel 0 has started saturating".
         max_iter:
             Upper bound on the number of trial acquisitions.
+        min_trials:
+            Minimum number of distinct-``t`` trials required before the
+            search is allowed to conclude ``floor_limited`` or finish
+            bisecting. A single trial's ratio can be noisy right around the
+            saturation boundary; this forces a few more measurements at
+            different exposure times before trusting that boundary,
+            instead of acting on one possibly-noisy reading.
 
         Returns
         -------
@@ -963,7 +971,7 @@ class HeliCamC3(Device):
                 "auto_expose: camera must be in intensity/steady mode -- "
                 "call set_measurement_mode('steady') first"
             )
-
+        self.set_attributes(SensExpRatio=1, SensNFrames=32) # start with ratio = 4
         sens_exp_ratio = self.get_attribute("SensExpRatio")
         nominal_ratio = self.SENSEXPRATIO_SHORT_LONG[sens_exp_ratio]
         table = []
@@ -1006,14 +1014,33 @@ class HeliCamC3(Device):
             _log.warning("auto_expose: initial acquisition failed, aborting")
             return not_found(t_min_us)
         if dev_lo:
-            _log.warning(
-                "auto_expose: channel 0 already saturating at the minimum "
-                "exposure t_min_us=%.1f -- cannot reduce exposure further; "
-                "lower the gain or incident light", t_lo,
-            )
-            return {"t_acquire_us": t_lo, "t_saturation_onset_us": t_lo,
-                    "nominal_ratio": nominal_ratio, "floor_limited": True,
-                    "ceiling_not_found": False, "table": table}
+            # A single noisy read at t_min_us can look saturated when it
+            # isn't. Saturation only grows with more exposure time, so
+            # confirm with a couple more (larger) trials before concluding
+            # floor-limited -- if one of them comes back unsaturated, the
+            # t_min_us reading was noise, not a real floor.
+            t_confirm, dev_confirm = t_lo, dev_lo
+            for _ in range(min_trials - 1):
+                t_confirm *= 2
+                if t_confirm > t_max_us:
+                    break
+                _, dev_confirm = trial(t_confirm)
+                if dev_confirm is None:
+                    return not_found(t_lo)
+                if not dev_confirm:
+                    break
+            if dev_confirm:
+                _log.warning(
+                    "auto_expose: channel 0 already saturating at the minimum "
+                    "exposure t_min_us=%.1f -- cannot reduce exposure further; "
+                    "lower the gain or incident light", t_lo,
+                )
+                return {"t_acquire_us": t_lo, "t_saturation_onset_us": t_lo,
+                        "nominal_ratio": nominal_ratio, "floor_limited": True,
+                        "ceiling_not_found": False, "table": table}
+            # Not actually floor-limited -- the t_min_us reading was noise.
+            # Resume the normal search from the confirmed-unsaturated point.
+            t_lo, dev_lo = t_confirm, dev_confirm
 
         t_hi, dev_hi = t_lo, dev_lo
         while not dev_hi and t_hi < t_max_us and len(table) < max_iter:
@@ -1031,7 +1058,13 @@ class HeliCamC3(Device):
             return not_found(t_hi)
 
         # Bisect [t_lo (unsaturated), t_hi (saturated)] to refine the onset.
-        while len(table) < max_iter and (t_hi - t_lo) > max(0.05 * t_hi, 0.5):
+        # Keep going past the tolerance target until min_trials total
+        # measurements have been taken -- a bracket found in only 1-2
+        # doubling steps is otherwise located from too few, possibly-noisy
+        # points.
+        while len(table) < max_iter and (
+            (t_hi - t_lo) > max(0.05 * t_hi, 0.5) or len(table) < min_trials
+        ):
             t_mid = (t_lo + t_hi) / 2
             _, dev_mid = trial(t_mid)
             if dev_mid is None:

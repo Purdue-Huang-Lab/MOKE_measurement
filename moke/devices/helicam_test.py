@@ -1,7 +1,7 @@
 """
 HeliCam C3 hardware test script -- run manually against real hardware.
 
-Six modes, one bench checkout item each. Each run creates a fresh
+Seven modes, one bench checkout item each. Each run creates a fresh
 ``helicam_test_data/helicam_test_NNN/`` folder (auto-incrementing) so
 repeated runs never clobber each other's data. Regardless of mode, every
 run finishes by dumping the full live register set to ``registers.json``
@@ -18,6 +18,7 @@ Usage::
     python -m moke.devices.helicam_test --mode 4
     python -m moke.devices.helicam_test --mode 5
     python -m moke.devices.helicam_test --mode 6
+    python -m moke.devices.helicam_test --mode 7
 
 Mode 1 -- lifecycle / exposure characterization:
     open -> steady mode -> gain=1x (best SNR, DdsGain=2) -> acquire across a
@@ -63,6 +64,18 @@ Mode 6 -- SensExpRatio sweep:
     them (channel 0 was eyeballed ~10x stronger than channel 1 in an
     earlier capture, at whatever SensExpRatio that run happened to use).
 
+Mode 7 -- no-flush raw sequence (is flush() actually needed, and how much):
+    open -> steady mode -> gain=1x (DdsGain=2) -> condition the pipeline at
+    a fixed exposure with one real flush() -> switch exposure to a very
+    different value -> immediately acquire several raw frames back-to-back
+    with **no flush() at all** in between, via ``cam._acquire()`` directly
+    (``acquire_single()``/``acquire_avg()``/``save_raw_np()`` all call
+    flush() internally, which would defeat the point here). Saves every raw
+    frame plus a per-frame channel0/channel1 summary, so a stale first frame
+    (still reflecting the old exposure) shows up as an outlier before the
+    sequence settles -- see auto_expose()'s per-trial flush() cost in
+    TODO.md #1b for why this matters.
+
 This script owns all visualization/GUI/file-IO weight -- ``helicam.py``
 stays a plain (non-GUI) device driver; see device_interface_instruction.md.
 """
@@ -104,6 +117,14 @@ DEFAULT_MODE5_T_ACQUIRE_US = 1.0
 # exposure mode 5 used.
 DEFAULT_MODE6_SENSEXPRATIO_LIST = (0, 1, 2, 3)
 DEFAULT_MODE6_T_ACQUIRE_US = 1.0
+
+# Mode 7: condition at a low exposure, switch to a much higher one, then
+# acquire several raw frames with no flush() at all -- a small SensNFrames
+# keeps each acquisition (and thus the whole no-flush sequence) fast.
+DEFAULT_MODE7_T_OLD_US = 16.0
+DEFAULT_MODE7_T_NEW_US = 2.0
+DEFAULT_MODE7_SENSNFRAMES = 32
+DEFAULT_MODE7_N_ACQUISITIONS = 6
 
 
 def _timed(label: str, fn, *args, level: int = logging.INFO, **kwargs):
@@ -600,15 +621,90 @@ def mode6_sensexpratio_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float, 
 
 
 # ----------------------------------------------------------------------
+# Mode 7 -- no-flush raw sequence
+# ----------------------------------------------------------------------
+
+def mode7_no_flush_raw(cam: HeliCamC3, out_dir: str, t_old_us: float, t_new_us: float,
+                        sensnframes: int, n_acquisitions: int) -> None:
+    """
+    Find out whether -- and for how many frames -- ``flush()`` is actually
+    needed, by removing it entirely from the one place it's meant to
+    matter: right after an exposure change.
+
+    Conditions the pipeline at ``t_old_us`` with one real ``flush()`` (a
+    known-clean starting point), switches to ``t_new_us``, then acquires
+    ``n_acquisitions`` raw frames back-to-back with **no flush() call
+    anywhere in between** -- straight ``cam._acquire()``, bypassing
+    ``acquire_single()``/``acquire_avg()``/``save_raw_np()``, all three of
+    which call ``flush()`` internally and would hide the effect being
+    tested. If the first acquisition (or first few) still reflects
+    ``t_old_us``'s magnitude before the rest settle onto ``t_new_us``'s,
+    that's the stale-frame problem flush() exists for, and how many frames
+    it actually takes to clear; if every frame already looks like
+    ``t_new_us``, flush() isn't buying anything at this boundary.
+    """
+    _timed(f"set_measurement_mode('steady', SensNFrames={sensnframes})",
+           cam.set_measurement_mode, "steady", SensNFrames=sensnframes)
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+
+    _timed(f"set_acquire_time({t_old_us}) [condition]", cam.set_acquire_time, t_old_us)
+    cam.flush()
+    warm = cam._acquire()
+    _log.info("Mode 7: conditioning acquisition at t_old_us=%.1f done (data=%s)",
+               t_old_us, "None" if warm is None else warm.shape)
+
+    _timed(f"set_acquire_time({t_new_us}) [switch, no flush after this]",
+           cam.set_acquire_time, t_new_us)
+
+    n_dark = cam.STEADY_SETTINGS["SensNDarkFrames"]
+    rows = []
+    for i in range(n_acquisitions):
+        t0 = time.monotonic()
+        data = cam._acquire()
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        if data is None:
+            _log.warning("Mode 7: acquisition %d failed (%.1f ms)", i, dt_ms)
+            rows.append({"index": i, "t_ms": dt_ms, "ch0_mean": None, "ch1_mean": None})
+            continue
+        np.savez(os.path.join(out_dir, f"mode7_noflush_raw{i}.npz"),
+                 data=data, cam_mode=cam._current_cammode)
+        arr = data.view(np.int16).astype(np.float64)
+        dark_ref = arr[:n_dark].mean(axis=0)
+        useful = (arr[n_dark:] - dark_ref[np.newaxis, ...]).mean(axis=0)
+        ch0_mean, ch1_mean = float(useful[..., 0].mean()), float(useful[..., 1].mean())
+        rows.append({"index": i, "t_ms": dt_ms, "ch0_mean": ch0_mean, "ch1_mean": ch1_mean})
+        _log.info("Mode 7: acquisition %d (%.1f ms) -> ch0=%.2f, ch1=%.2f", i, dt_ms, ch0_mean, ch1_mean)
+
+    save_table(out_dir, "mode7_noflush_table", rows)
+    save_json(out_dir, "mode7_params", {
+        "t_old_us": t_old_us, "t_new_us": t_new_us,
+        "sensnframes": sensnframes, "n_acquisitions": n_acquisitions,
+    })
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    idx = [r["index"] for r in rows]
+    ch0 = [r["ch0_mean"] for r in rows]
+    ch1 = [r["ch1_mean"] for r in rows]
+    ax.plot(idx, ch0, "o-", label="channel 0 (long)")
+    ax.plot(idx, ch1, "o-", label="channel 1 (short)")
+    ax.set_xlabel("acquisition index (no flush() between any of these)")
+    ax.set_ylabel("dark-subtracted mean")
+    ax.set_title(f"Mode 7: no-flush sequence, t_old={t_old_us:g}us -> t_new={t_new_us:g}us")
+    ax.legend()
+    fig.savefig(os.path.join(out_dir, "mode7_summary.png"))
+    plt.show()
+
+
+# ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6], required=True,
+    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6, 7], required=True,
                          help="1=lifecycle/exposure-gain, 2=lock-in detection, 3=streaming, "
                               "4=auto_expose() checkout, 5=SensNFrames sweep, "
-                              "6=SensExpRatio sweep")
+                              "6=SensExpRatio sweep, 7=no-flush raw sequence")
     parser.add_argument("--sys-id", type=str, default="c3cam_sl70")
     parser.add_argument("--t-acquire-us", type=float, default=DEFAULT_T_ACQUIRE_US,
                          help="Starting exposure time in microseconds, modes 2/3 (default: %(default)s)")
@@ -634,6 +730,9 @@ def main():
             mode5_frames_sweep(cam, out_dir, DEFAULT_MODE5_T_ACQUIRE_US, DEFAULT_MODE5_SENSNFRAMES_LIST)
         elif args.mode == 6:
             mode6_sensexpratio_sweep(cam, out_dir, DEFAULT_MODE6_T_ACQUIRE_US, DEFAULT_MODE6_SENSEXPRATIO_LIST)
+        elif args.mode == 7:
+            mode7_no_flush_raw(cam, out_dir, DEFAULT_MODE7_T_OLD_US, DEFAULT_MODE7_T_NEW_US,
+                                DEFAULT_MODE7_SENSNFRAMES, DEFAULT_MODE7_N_ACQUISITIONS)
 
         cam.dump_registers(out_dir)
 
