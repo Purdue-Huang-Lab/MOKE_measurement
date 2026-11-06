@@ -486,38 +486,39 @@ class _StreamAccumulator:
         return self.total_count / dt if dt > 0 else 0.0
 
 
-def _acquire_worker(cam: HeliCamC3, label: str, controls: _StreamControls,
+def _acquire_worker(frames, label: str, controls: _StreamControls,
                      acc: _StreamAccumulator) -> None:
     """
-    Background thread: calls ``acquire_light()`` in a tight loop, as fast
-    as possible -- no plotting, no pacing, nothing GUI-related. This is
-    what decouples measurement rate from plotting rate; the GUI thread
-    never blocks it and it never waits on the GUI. Stops when
+    Background thread: pulls frames from ``cam.stream()`` as fast as
+    possible -- no plotting, no pacing, nothing GUI-related. This is what
+    decouples measurement rate from plotting rate. Stops when
     ``controls.running`` goes False (set by the "Move on" button, the
     window closing, or a fatal acquisition error here).
     """
-    while controls.running:
-        if controls.paused:
-            time.sleep(0.01)
-            continue
-        try:
-            frame = cam.acquire_light()
-        except Exception:
-            _log.exception("stream(%s): acquire_light() raised, stopping stream", label)
-            controls.running = False
-            break
-        if frame is not None:
+    try:
+        for frame in frames:
+            while controls.paused and controls.running:
+                time.sleep(0.01)
+            if not controls.running:
+                break
             acc.add(frame)
+    except Exception:
+        _log.exception("stream(%s): cam.stream() raised, stopping stream", label)
+    controls.running = False
 
 
-def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
+def stream(frames, first_frame, out_dir: str, label: str, fps: float = 10.0) -> None:
     """
     Live preview loop. Not fancy -- this is a manual bench test tool, not a
     product UI. Pause/Start/Save/Move on buttons; closing the window also
     ends the stream.
 
+    ``frames`` is a ``cam.stream(...)`` generator that has already yielded
+    ``first_frame`` (the caller pulls it, so the camera is configured
+    before this window opens).
+
     Acquisition runs on a background thread (see ``_acquire_worker()``) as
-    fast as ``acquire_light()`` allows -- the GUI thread never throttles
+    fast as ``cam.stream()`` allows -- the GUI thread never throttles
     it. Each redraw pulls whatever frames accumulated since the last one
     and displays their mean (``_StreamAccumulator``), so plotting cost
     never limits the measurement rate. The title shows both numbers
@@ -533,11 +534,8 @@ def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
     controls = _StreamControls()
     acc = _StreamAccumulator()
 
-    frame = _timed(f"acquire_light() [stream {label}, initial]", cam.acquire_light)
-    if frame is None:
-        raise RuntimeError(f"stream({label}): initial acquire_light() returned no data")
-    img = amplitude_channel(frame)
-    last_frame = frame
+    img = amplitude_channel(first_frame)
+    last_frame = first_frame
 
     fig, ax = plt.subplots()
     plt.subplots_adjust(bottom=0.25)
@@ -555,7 +553,7 @@ def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
     b_moveon.on_clicked(controls.on_move_on)
 
     worker = threading.Thread(
-        target=_acquire_worker, args=(cam, label, controls, acc),
+        target=_acquire_worker, args=(frames, label, controls, acc),
         name=f"stream-{label}-acquire", daemon=True,
     )
     worker.start()
@@ -604,11 +602,12 @@ def mode3_streaming(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
     # back-to-back reconfigure (with SensNFrames changing 256->32) that
     # broke the second call -- see run 020-024 logs, which all show the
     # *first* configure succeeding and the *second* one timing out.
-    _timed("set_streaming_params('smooth_amplitude')", cam.set_streaming_params,
-           "smooth_amplitude", n_frames=8)
-    _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+    # t_acquire_us is unused here: set_acquire_time() only affects CamMode 3
+    # (knowledge base §10).
+    frames = cam.stream("smooth_amplitude", n_frames=16, SensNavM2=128)
+    first_frame = _timed("cam.stream() configure + first frame", next, frames)
     cam.dump_registers(out_dir, "mode3_registers_before_amp_stream")
-    stream(cam, out_dir, "smooth_amplitude", fps=1.0)  # 1 Hz redraw -- measurement itself is unthrottled, see stream()'s docstring
+    stream(frames, first_frame, out_dir, "smooth_amplitude", fps=3.0)  # GUI redraw rate only -- measurement is unthrottled
 
 
 # ----------------------------------------------------------------------

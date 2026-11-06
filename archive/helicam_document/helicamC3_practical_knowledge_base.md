@@ -410,6 +410,42 @@ possibility for *some* captures, just not this one).
 
 ---
 
+## 10. Streaming rate in CamMode 1/2 is USB-limited, ~5 ms per frame
+
+Measured 2026-11-06, runs `helicam_test_021`–`032`, smooth_amplitude via
+`set_streaming_params()` + `acquire_light()`, fd = 148.3 kHz (`SensTqp=29`).
+
+| SensNavM2 | SensNFrames | fps | ms / frame |
+|---|---|---|---|
+| 32 | 8 | 24.7 | 5.1 |
+| 48 | 8 / 16 / 32 | 24.6 / 12.0 / 6.1 | 5.1–5.2 |
+| 96 | 4 / 6 / 8 / 16 | 43.5 / 28.0 / 20.6 / 10.4 | 5.75–6.1 |
+| 16 | 8 | timeout (-116) | – |
+
+- **Time per acquisition ∝ `SensNFrames`, no fixed overhead.** CamMode 1/2
+  return the whole frame stack (300×300×2 B = 180 kB/frame); at 36.5 MB/s
+  that is 4.9 ms/frame — matches. `fps ≈ 200 / SensNFrames`.
+- **`SensNavM2` is nearly free** up to ~48 (32→48 no change); 48→96 costs
+  ~18 % fps for 2× cycles — still a net SNR-per-second gain.
+- **`SensNFrames` minimum is 10, all modes** (register description §2.8,
+  range `0xa–0x1ff`). Runs with 4/6/8 were out of spec; 031 (4 frames) gave
+  visibly wrong data. Stream at `n_frames=10` → ~20 fps max.
+- **Max internal frame rate 3800 fps** (manual §5, `SensNavM2` entry).
+  Frame time `Tfr = (Nc + 1)/fd` with `BSEnable=1, CalDur1Cyc=1`. At
+  148.3 kHz, `SensNavM2=16` → 4240 fps → over the limit → explains run 026's
+  timeouts. Minimum at this fd: `SensNavM2 ≥ 18`.
+- **`set_acquire_time()` does nothing in CamMode 1/2** — it only writes
+  CamMode-3 exposure registers.
+- **`FrmDur35MHz` readback is stale:** read 23364 (correct for
+  `SensNavM2=48`) in every run, including 32 and 96. Don't use it as a live
+  readback; `estimate_acquire_time()`'s sensor term inherits this.
+- **No code sets `SensNavM2` by default** — 48 was left on the camera from
+  earlier. Pass it explicitly to `set_streaming_params()`.
+- Untested ways to go faster: USB 3 port (if the camera supports it),
+  `Comp11to8` 8-bit output (halves bytes).
+
+---
+
 ## Open questions (not yet resolved)
 
 - Now that CamMode-3 reports channel 1 (short exposure) only instead of

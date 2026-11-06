@@ -17,18 +17,12 @@ full writeup. Short version of where it's at:
   background thread (`_acquire_worker`), fully decoupled from GUI redraw
   rate, with a `_StreamAccumulator` handing averaged frames to the plot.
   Working on hardware.
-- **Left unresolved:** swept `--t-acquire-us` from 2 to 16000 expecting it
-  to change smooth_amplitude's streaming fps — it didn't (flat ~20-24 fps
-  throughout). Root cause identified (not yet acted on): `set_acquire_time()`
-  only writes `SensExpTime`/`SensExpTimeMult`, which are CamMode-3
-  ("intensity") registers per their own register-description text —
-  CamMode 2 (`smooth_amplitude`) ignores them entirely. The real fps lever
-  for CamMode 1/2 is the demod cycle count/frequency (`SensNavM2`/
-  `SensTqp`), which `mode3_streaming()` currently never sets — it inherits
-  whatever's left on the camera. **Next step:** wire an explicit
-  `SensNavM2` (or demod-frequency) override into the smooth_amplitude
-  `set_streaming_params()` call and sweep *that* instead, to get a real
-  fps-vs-demod-rate characterization.
+- **Resolved 2026-11-06:** streaming fps is USB-limited, ~5 ms per frame,
+  so `fps ≈ 200 / SensNFrames`. `SensNFrames` minimum is 10 (documented),
+  `SensNavM2 ≥ 18` at fd = 148.3 kHz (3800 fps limit). Full table and
+  reasoning: knowledge base §10. Recommended stream settings:
+  `n_frames=10`, `SensNavM2` 48–96, set explicitly.
+- **Next:** build a stream function into `HeliCamC3` (see §6).
 - Also still mechanistically unexplained (currently just avoided, not
   understood): back-to-back reconfiguring of the same mode (two
   `set_measurement_mode()`/`set_streaming_params()` calls in a row, no
@@ -266,7 +260,13 @@ redraw rate only, not acquisition (`mode3_streaming()` currently uses
 `fps=1.0` — redraw once/sec, per request; measurement itself is
 unthrottled). Confirmed working on hardware.
 
-**Open thread — `t_acquire_us` sweep gave a false-flat result:**
+**Update 2026-11-06 — fps characterized (runs 021–032), see knowledge
+base §10.** Summary: `fps ≈ 200 / SensNFrames` (USB transfer, 180 kB/frame);
+`SensNavM2` nearly free up to ~48; `SensNFrames` < 10 is out of spec (runs
+with 4/6/8 frames — 031 gave wrong data); `SensNavM2=16` timed out (over the
+3800 fps internal limit). The thread below is closed by this.
+
+**Open thread (closed, see update above) — `t_acquire_us` sweep gave a false-flat result:**
 `mode3_streaming()` calls `cam.set_acquire_time(t_acquire_us)` before
 streaming `smooth_amplitude`, but `set_acquire_time()` only writes
 `SensExpTime`/`SensExpTimeMult` — its own docstring says "for intensity

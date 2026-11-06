@@ -988,6 +988,25 @@ class HeliCamC3(Device):
             return None
         return self.data_reformat(data)
 
+    def stream(self, mode: str, n_frames: int = 10, **settings):
+        """
+        Configure once, then yield frames until the caller stops iterating.
+
+            for frame in cam.stream("smooth_amplitude", SensNavM2=64):
+                ...   # break to stop
+
+        Yields the same arrays as ``acquire_light()``; failed acquisitions
+        (None) are skipped. Threading, averaging and display belong to the
+        caller (plan doc §5.6). ``n_frames`` must be >= 10 (SensNFrames
+        minimum, register description §2.8). See knowledge base §10 for
+        the frame-rate tradeoffs.
+        """
+        self.set_streaming_params(mode, n_frames=n_frames, **settings)
+        while True:
+            frame = self.acquire_light()
+            if frame is not None:
+                yield frame
+
     def null_offset(self, n_acquisitions: int = 10) -> tuple[np.ndarray, np.ndarray]:
         """
         Measure the real per-pixel I/Q offset in rawIQ mode (CamMode 0) by
