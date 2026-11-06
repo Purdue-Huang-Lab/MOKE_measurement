@@ -1,4 +1,44 @@
-# TODO / handoff — heliCam C3 driver work (updated 2026-08-11)
+# TODO / handoff — heliCam C3 driver work (updated 2026-08-12)
+
+## RESUME HERE — first thing to discuss next session
+
+Stopped mid-investigation on mode 3 (live streaming) — see §6 below for the
+full writeup. Short version of where it's at:
+
+- Today's `TrigFreeExtN` hang (smooth_amplitude timing out with
+  "-116, timeout or no trigger") is fixed and confirmed on hardware —
+  `RAWIQ_SETTINGS`/`AMPLITUDE_SETTINGS`/`SMOOTH_AMPLITUDE_SETTINGS` now all
+  set `TrigFreeExtN=1` explicitly, same footgun-prevention pattern already
+  used for `SensNFrames` in those dicts.
+- `helicam.py` gained `set_streaming_params()`/`acquire_light()` (a
+  flush-once-then-repeat-fast pair, replacing `acquire_single()`'s
+  per-call flush for streaming use) — see §6 for why.
+- `stream()` (`helicam_test.py`) was redesigned to run acquisition on a
+  background thread (`_acquire_worker`), fully decoupled from GUI redraw
+  rate, with a `_StreamAccumulator` handing averaged frames to the plot.
+  Working on hardware.
+- **Left unresolved:** swept `--t-acquire-us` from 2 to 16000 expecting it
+  to change smooth_amplitude's streaming fps — it didn't (flat ~20-24 fps
+  throughout). Root cause identified (not yet acted on): `set_acquire_time()`
+  only writes `SensExpTime`/`SensExpTimeMult`, which are CamMode-3
+  ("intensity") registers per their own register-description text —
+  CamMode 2 (`smooth_amplitude`) ignores them entirely. The real fps lever
+  for CamMode 1/2 is the demod cycle count/frequency (`SensNavM2`/
+  `SensTqp`), which `mode3_streaming()` currently never sets — it inherits
+  whatever's left on the camera. **Next step:** wire an explicit
+  `SensNavM2` (or demod-frequency) override into the smooth_amplitude
+  `set_streaming_params()` call and sweep *that* instead, to get a real
+  fps-vs-demod-rate characterization.
+- Also still mechanistically unexplained (currently just avoided, not
+  understood): back-to-back reconfiguring of the same mode (two
+  `set_measurement_mode()`/`set_streaming_params()` calls in a row, no
+  intervening real read, `SensNFrames` changing between them) reliably
+  broke the *second* call's warm-up on 5/5 fresh hardware runs. Simplifying
+  to a single configure call sidestepped it, but the actual cause is still
+  open — `SensCfgBusy` ("device busy, triggers ignored") not being polled
+  between reconfigures is the leading suspect, untested.
+
+---
 
 Background reading, in order of how foundational they are:
 1. `archive/helicam_document/helicamC3_practical_knowledge_base.md` — what
@@ -142,7 +182,36 @@ see the knowledge base for the full per-CamMode size table.
 
 ---
 
-## 3. test the effectness of FWHMnFrame in smooth_amplitude run
+## 3. Needs a hardware run — effectiveness of FWHMnFrame in smooth_amplitude
+
+**Why:** `SMOOTH_AMPLITUDE_SETTINGS`'s `FWHMnFrame` (register description
+§5.2.2, 0=no filter / 1=2 frames / 2=6 frames / 3=10 frames / 4=20 frames)
+applies an on-device matched filter across the acquired frame stack before
+it's returned. But `data_reformat()` already averages the *entire*
+`SensNFrames` stack down to one frame regardless of `FWHMnFrame` (its
+CamMode 1/2 branch, `helicam.py`) — for a filter applied earlier in the
+same stack, averaging afterwards should mostly commute with it, so any
+real benefit can only come from edge effects (the filter's own boundary
+tapering over its first/last few frames, a few percent of
+`SensNFrames=256`). Whether that residual effect is big enough to matter
+was an open, unmeasured question.
+
+**What was built:** `mode8_fwhm_sweep()` (`helicam_test.py`, `--mode 8`).
+For a CamMode-1 "amplitude" baseline (filter off) and every `FWHMnFrame`
+value 0-4, it acquires `n_repeats=4` *independent* acquisitions
+back-to-back (same settings throughout) and computes the per-pixel std
+across those repeats — genuine inter-acquisition noise, which a single
+acquisition's own full-stack averaging can't show on its own. Saves every
+repeat frame, a `mode8_fwhm_sweep_table.csv` (mean amplitude +
+repeat-to-repeat std per value), and two summary plots (mean-frame grid,
+repeat-to-repeat std vs `FWHMnFrame` with the baseline as a reference
+line).
+
+**To test:** run `--mode 8` and check whether `repeat_noise_std` actually
+drops as `FWHMnFrame` increases, or is flat within noise (in which case
+the on-device filter isn't buying anything over what `data_reformat()`'s
+own averaging already does, and `SMOOTH_AMPLITUDE_SETTINGS`'s default of
+`FWHMnFrame=2` should be reconsidered/documented as arbitrary).
 
 ---
 
@@ -153,6 +222,84 @@ Current `git status --short`: modified `TODO.md`, `moke/devices/helicam.py`,
 `moke/devices/manual_test.py` and a `moke/devices/helicam_test_data/
 260811-lockin mode/` results folder. None of this is committed — do that
 (or review/discard) before considering this work "saved" in git history.
+
+---
+
+## 6. In progress — mode 3 background-threaded streaming + smooth_amplitude fps
+
+**Why this started:** mode 3's live preview (`stream()`) was pinned at
+~0.2 fps because `acquire_single()` flushes before every acquisition, and
+in volume modes that flush is a full extra acquisition, not a cheap drain
+(confirmed on hardware: consecutive flush log lines were ~2x
+`estimate_acquire_time()`'s prediction apart).
+
+**Driver change:** added `HeliCamC3.set_streaming_params()`/
+`acquire_light()` (`helicam.py`) — `set_streaming_params()` is a thin
+wrapper around `set_measurement_mode()`; `acquire_light()` reads one frame
+via `_acquire()` + `data_reformat()` with no per-call `flush()`. Purely
+additive — no existing method touched. `arm()`/`read_frame()`/
+`set_demod_clock()` were deliberately left alone (the plan doc's API
+prescription for them was removed, see `wide field tr-moke plan.md` §5.3
+diff — they're reserved for the real per-trigger lock-in loop whenever
+`acquire.py` gets built, not this).
+
+**Bug found and fixed while testing amplitude/smooth_amplitude via the new
+methods:** `RAWIQ_SETTINGS`/`AMPLITUDE_SETTINGS`/`SMOOTH_AMPLITUDE_SETTINGS`
+never set `TrigFreeExtN` (unlike `STEADY_SETTINGS`, which does). If that
+register was ever left at 0 ("acquisition controlled by external trigger
+source") by anything else, every acquisition in those modes hangs until
+`HeliCamC3`'s fixed `timeout_ms` and returns -116 — confirmed on hardware,
+fixed by setting `TrigFreeExtN=1` explicitly in all three settings dicts
+(and the inline `minimum_energy` dict). Unrelated to the demod-clock/PEM
+topic (§ below, `open_issue_helicam.md` #2/#3) — different register,
+different concept (trigger source vs. demodulation reference frequency).
+
+**`stream()` redesign (`helicam_test.py`):** acquisition now runs on a
+background thread (`_acquire_worker`) calling `acquire_light()` in a tight
+loop, fully decoupled from the GUI. `_StreamAccumulator` is the thread-safe
+handoff: the worker calls `add()` per frame, the GUI thread calls
+`pop_average()` once per redraw (returns the mean since the last redraw,
+resets). Title bar shows `measurement X.XX fps` (real acquisition rate,
+running total since stream start — stable, not reset per redraw) and
+`plotted N (avg of M)` separately from it. `fps` param now controls GUI
+redraw rate only, not acquisition (`mode3_streaming()` currently uses
+`fps=1.0` — redraw once/sec, per request; measurement itself is
+unthrottled). Confirmed working on hardware.
+
+**Open thread — `t_acquire_us` sweep gave a false-flat result:**
+`mode3_streaming()` calls `cam.set_acquire_time(t_acquire_us)` before
+streaming `smooth_amplitude`, but `set_acquire_time()` only writes
+`SensExpTime`/`SensExpTimeMult` — its own docstring says "for intensity
+mode (CamMode=3)", and CamMode 2 doesn't use either register (it does
+on-sensor demodulation, not exposure-timed integration). So the 2→16000µs
+sweep changing nothing (flat ~20-24 fps) is expected, not a bug or hidden
+overhead. The actual timing knob for CamMode 1/2 is `SensNavM2`/`SensTqp`
+(`Tfr = Nc/fd`, `Nc = SensNavM2*2+2`) — currently unset by
+`mode3_streaming()` for smooth_amplitude, inherited from whatever was last
+on the camera. **To test next:** add an explicit `SensNavM2` (or a
+demod-frequency-based) override to the smooth_amplitude
+`set_streaming_params()` call and sweep that instead.
+
+**Open thread — unexplained double-configure failure:** while debugging
+the `TrigFreeExtN` hang, found that calling `set_measurement_mode()`/
+`set_streaming_params()` twice in a row for the same mode (no successful
+read in between beyond the first call's own warm-up, `SensNFrames`
+changing between the two calls) reliably broke the *second* call's
+warm-up — reproduced 5/5 times across fresh camera opens (run logs
+020-024, `helicam_test_data/`). Ruled out: stale register state (fresh
+opens every time), demod-register values (identical between a working and
+a failing dump). Not yet explained mechanistically. Leading suspect:
+`SensCfgBusy` ("1: Device is busy and triggers will be ignored", register
+description AcqCtrl 0x03) not being polled/waited-on between
+`AcqStop=1`→write→`AcqStop=0` sequences — if the second reconfigure's
+warm-up trigger lands while the FPGA is still applying the first one, it
+would be silently ignored, matching the exact symptom. Currently just
+avoided (mode 3 does one clean configure only) rather than fixed or
+confirmed. Also notable: mode 8 reconfigures `smooth_amplitude` 5 times in
+a row successfully — the difference there is `SensNFrames` stays constant
+across its repeated calls (only `FWHMnFrame` changes), so "changing
+`SensNFrames` on a reconfigure" specifically is the untested variable, not
+reconfiguring per se.
 
 ---
 

@@ -33,7 +33,36 @@ for real lock-in acquisition, not cosmetic.
 
 **Needed to close:** same as #1 — doxygen `.chm` or Heliotis.
 
-## 3. CamMode 3 (intensity) format mismatch — untested
+## 3. Lock-in modulation effectiveness — unverified whether camera `fd` actually tracks the light source
+
+Because of #2 (no external demod-clock lock), the camera's demodulation
+frequency `fd` (set via `SensTqp` / `set_internal_demod()`) always
+free-runs off its own internal 70 MHz clock — it is never locked to
+whatever actually drives the light modulation (e.g. a PEM's 2f reference).
+Nobody has yet checked, on real hardware, whether the nominal `fd` you set
+actually matches the light's real modulation frequency, or whether the two
+drift apart over an acquisition (PEMs in particular are resonant and
+drift).
+
+Two ways to check, per the vendor docs — neither implemented/run yet:
+- **Software, no extra hardware:** manual §5.1
+  (`heliCamC3_manual_v1_15.md:276`) describes watching individual
+  (unaveraged) rawIQ frames over time — if `fd` and the light's real
+  modulation frequency match, a static I/Q point stays fixed frame-to-frame
+  (up to noise); if they're mismatched by `Δf`, I/Q rotates in the I-Q
+  plane at rate `Δf`, a directly measurable beat frequency. Would need a
+  small new test mode (`helicam_test.py`) capturing a rawIQ sequence and
+  plotting/measuring the I/Q rotation.
+- **Hardware, needs a scope:** `EnSynFOut` (register description §2.4,
+  manual §2.4.1/appendix A2) puts a rectangular signal at exactly `fd` on
+  OUT1/OUT3 — probe it against the actual modulation drive signal
+  directly.
+
+**Needed to close:** run either check on real hardware and record whether
+a measurable mismatch/drift exists; if it does, #2 (external demod-clock
+lock) becomes the actual blocker to fix, not just a theoretical gap.
+
+## 4. CamMode 3 (intensity) format mismatch — untested
 
 The programmer's manual documents CamMode 3 as using `CamDataFmt = DF_Hf`
 (32-bit float), with the SDK doing dark-frame subtraction + HDR combination
@@ -47,7 +76,7 @@ without testing against real hardware first — it may break a working path,
 or it may be the actually-correct fix. See `_MODE_TO_FMT` in helicam.py for
 the inline note.
 
-## 4. `HE_Open` return-code vs. handle — unverified against docs
+## 5. `HE_Open` return-code vs. handle — unverified against docs
 
 `open()`'s docstring claims `HE_Open` returns non-zero (1) on a healthy open
 for this camera, and that the handle (not the return code) is the real
@@ -56,13 +85,13 @@ return-code convention at all. This is currently based on field
 observation only. Not contradicted by the docs, just not confirmable from
 them.
 
-## 5. `AllocCamData` trailing args — unverified
+## 6. `AllocCamData` trailing args — unverified
 
 The three trailing `0, 0, 0` args in `self._lib.AllocCamData(1, fmt, 0, 0, 0)`
 are not explained in any of the three docs — the programmer's manual defers
 to the doxygen `.chm` for this call's exact argument semantics.
 
-## 6. `set_roi` — commented out, unconfirmed capability
+## 7. `set_roi` — commented out, unconfirmed capability
 
 Was a no-op stub with a full docstring pretending it worked (silent
 wrong-but-plausible behavior). Commented out in helicam.py rather than left
@@ -73,21 +102,12 @@ post-acquisition windowing on the full frame, not a hardware sensor crop —
 worth deciding whether a hardware `set_roi` is needed at all before
 re-implementing it.
 
-## 7. Not implemented — stubs, no hardware capability confirmed yet
+## 8. Not implemented — stubs, no hardware capability confirmed yet
 
 These `raise NotImplementedError` and are not wired to any hardware call:
 - `set_internal_trigger(f_hz, phase)`
 - `get_trigger_status()`
 - `stream_on_trigger(t_acquire_s, n_frames)`
-
-## 8. Known-wrong callers already fixed
-
-- `rig.py`'s `camera_acquire()` called a nonexistent `HeliCamC3.acquire()` —
-  fixed to call `acquire_single()`.
-- `helicam_test.py` still calls `cam.acquire()`, which does not exist on
-  `HeliCamC3` — **left untouched deliberately** (explicit instruction not to
-  touch this file). Whoever picks this file back up should either add an
-  `acquire` alias or update the test to call `acquire_single()`.
 
 ## 9. `auto_expose()` — broken fallback + no recovery after a timeout
 

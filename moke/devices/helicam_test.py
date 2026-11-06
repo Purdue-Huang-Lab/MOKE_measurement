@@ -19,6 +19,7 @@ Usage::
     python -m moke.devices.helicam_test --mode 5
     python -m moke.devices.helicam_test --mode 6
     python -m moke.devices.helicam_test --mode 7
+    python -m moke.devices.helicam_test --mode 8
 
 Mode 1 -- lifecycle / exposure characterization:
     open -> steady mode -> gain=1x (best SNR, DdsGain=2) -> acquire across a
@@ -39,6 +40,12 @@ Mode 3 -- streaming:
     to 10 fps (throttled to the camera's own estimated acquire time if
     slower) with Pause / Start / Save frame / Move on buttons -> switch to
     amplitude mode -> stream again. Does NOT use auto_expose() -- see mode 4.
+    Uses cam.set_streaming_params()/cam.acquire_light() instead of
+    set_measurement_mode()/acquire_single() -- the latter flushes before
+    every acquisition, which in volume modes (SensNFrames=256) costs a
+    full extra acquisition per displayed frame (confirmed on real
+    hardware: ~2x the predicted per-frame time). acquire_light() flushes
+    once at set_streaming_params() time instead of on every call.
 
 Mode 4 -- auto_expose() checkout:
     open -> steady mode -> gain=1x (DdsGain=2) -> auto_expose() -> record
@@ -81,6 +88,19 @@ Mode 7 -- no-flush raw sequence (is flush() actually needed, and how much):
     sequence settles -- see auto_expose()'s per-trial flush() cost in
     TODO.md #1b for why this matters.
 
+Mode 8 -- smooth_amplitude FWHMnFrame effectiveness sweep:
+    open -> steady mode -> gain=1x (DdsGain=2) -> fixed exposure -> for a
+    CamMode-1 "amplitude" baseline (FWHMnFrame off) and every FWHMnFrame
+    value (0-4), acquire several *independent* repeat acquisitions
+    back-to-back and compute the per-pixel std across those repeats --
+    genuine inter-acquisition noise, the one thing a single acquisition's
+    own full-stack averaging can't show. data_reformat() already averages
+    the entire SensNFrames stack down to one frame regardless of
+    FWHMnFrame (see its CamMode 1/2 docstring in helicam.py), so whether
+    the on-device matched filter buys anything beyond that Python-side
+    averaging is an open, TODO.md #3, empirical question -- this mode is
+    how to answer it on real hardware.
+
 This script owns all visualization/GUI/file-IO weight -- ``helicam.py``
 stays a plain (non-GUI) device driver; see device_interface_instruction.md.
 """
@@ -91,6 +111,7 @@ import glob
 import json
 import logging
 import os
+import threading
 import time
 
 import matplotlib
@@ -130,6 +151,15 @@ DEFAULT_MODE7_T_OLD_US = 16.0
 DEFAULT_MODE7_T_NEW_US = 2.0
 DEFAULT_MODE7_SENSNFRAMES = 32
 DEFAULT_MODE7_N_ACQUISITIONS = 6
+
+# Mode 8: FWHMnFrame register codes (SMOOTH_AMPLITUDE_SETTINGS's comment,
+# manual §5.2.2): 0=no filter, 1=2 frames, 2=6 frames, 3=10 frames,
+# 4=20 frames. n_repeats independent acquisitions per value -- the whole
+# point is measuring repeat-to-repeat (inter-acquisition) noise, which one
+# acquisition alone can't show. Exposure comes from --t-acquire-us
+# (DEFAULT_T_ACQUIRE_US), same as modes 2/3, not a separate default here.
+DEFAULT_MODE8_FWHM_LIST = (0, 1, 2, 3, 4)
+DEFAULT_MODE8_N_REPEATS = 4
 
 
 def _timed(label: str, fn, *args, level: int = logging.INFO, **kwargs):
@@ -350,13 +380,13 @@ def mode2_lockin(cam: HeliCamC3, out_dir: str, t_acquire_us: float, offset_metho
     _log.info("Mode 2: amplitude -- mean=%.1f", amplitude_frame.mean())
 
     _timed("set_measurement_mode('smooth_amplitude')", cam.set_measurement_mode, "smooth_amplitude")
+    cam.dump_registers(out_dir, "mode2_registers_before_smooth_amplitude")
     smooth_amplitude_frame = _timed("acquire_single() [smooth_amplitude]", cam.acquire_single)   # (292, 280) float32, frame-averaged
     if smooth_amplitude_frame is None:
         raise RuntimeError("mode2: smooth_amplitude acquire_single() returned no data")
     save_frame(out_dir, "mode2_smooth_amplitude_frame", smooth_amplitude_frame)
     _log.info("Mode 2: smooth amplitude -- mean=%.1f", smooth_amplitude_frame.mean())
     cam.set_attributes(AcqStop = 1) # stop acquisition
-
     save_json(out_dir, "mode2_params", {
         "t_acquire_us": t_acquire_us,
         "gain_DdsGain": cam.get_attribute("DdsGain"),
@@ -409,18 +439,105 @@ class _StreamControls:
         self.running = False
 
 
+class _StreamAccumulator:
+    """
+    Thread-safe handoff point between the background acquisition thread
+    and the GUI thread. The acquisition thread calls ``add()`` for every
+    real frame it gets; the GUI thread calls ``pop_average()`` once per
+    redraw, which returns the mean of everything accumulated since the
+    last call (and resets) -- so a slow plot never throttles acquisition,
+    and a fast plot just sees fewer frames averaged together per redraw.
+
+    ``total_count``/``start_time`` are never reset -- they're what
+    ``measurement_fps`` is based on, giving a stable, GUI-refresh-
+    independent measurement rate instead of a noisy per-redraw one.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending_sum = None
+        self._pending_count = 0
+        self.total_count = 0
+        self.start_time = time.monotonic()
+
+    def add(self, frame: np.ndarray) -> None:
+        with self._lock:
+            if self._pending_sum is None:
+                self._pending_sum = frame.astype(np.float64)
+            else:
+                self._pending_sum += frame
+            self._pending_count += 1
+            self.total_count += 1
+
+    def pop_average(self):
+        """Return (average_frame, n_averaged) since the last call, or (None, 0)."""
+        with self._lock:
+            if self._pending_count == 0:
+                return None, 0
+            avg = self._pending_sum / self._pending_count
+            n = self._pending_count
+            self._pending_sum = None
+            self._pending_count = 0
+            return avg, n
+
+    @property
+    def measurement_fps(self) -> float:
+        dt = time.monotonic() - self.start_time
+        return self.total_count / dt if dt > 0 else 0.0
+
+
+def _acquire_worker(cam: HeliCamC3, label: str, controls: _StreamControls,
+                     acc: _StreamAccumulator) -> None:
+    """
+    Background thread: calls ``acquire_light()`` in a tight loop, as fast
+    as possible -- no plotting, no pacing, nothing GUI-related. This is
+    what decouples measurement rate from plotting rate; the GUI thread
+    never blocks it and it never waits on the GUI. Stops when
+    ``controls.running`` goes False (set by the "Move on" button, the
+    window closing, or a fatal acquisition error here).
+    """
+    while controls.running:
+        if controls.paused:
+            time.sleep(0.01)
+            continue
+        try:
+            frame = cam.acquire_light()
+        except Exception:
+            _log.exception("stream(%s): acquire_light() raised, stopping stream", label)
+            controls.running = False
+            break
+        if frame is not None:
+            acc.add(frame)
+
+
 def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
     """
     Live preview loop. Not fancy -- this is a manual bench test tool, not a
     product UI. Pause/Start/Save/Move on buttons; closing the window also
     ends the stream.
+
+    Acquisition runs on a background thread (see ``_acquire_worker()``) as
+    fast as ``acquire_light()`` allows -- the GUI thread never throttles
+    it. Each redraw pulls whatever frames accumulated since the last one
+    and displays their mean (``_StreamAccumulator``), so plotting cost
+    never limits the measurement rate. The title shows both numbers
+    separately: "measurement fps" (real acquisition rate, GUI-independent)
+    and how many frames were averaged into the frame just plotted.
+
+    Parameters
+    ----------
+    fps:
+        Requested GUI redraw rate. Display-only -- does not throttle
+        acquisition. None redraws as fast as the GUI event loop allows.
     """
     controls = _StreamControls()
+    acc = _StreamAccumulator()
 
-    frame = _timed(f"acquire_single() [stream {label}, initial]", cam.acquire_single)
+    frame = _timed(f"acquire_light() [stream {label}, initial]", cam.acquire_light)
     if frame is None:
-        raise RuntimeError(f"stream({label}): initial acquire_single() returned no data")
+        raise RuntimeError(f"stream({label}): initial acquire_light() returned no data")
     img = amplitude_channel(frame)
+    last_frame = frame
 
     fig, ax = plt.subplots()
     plt.subplots_adjust(bottom=0.25)
@@ -437,52 +554,61 @@ def stream(cam: HeliCamC3, out_dir: str, label: str, fps: float = 10.0) -> None:
     b_save.on_clicked(controls.on_save)
     b_moveon.on_clicked(controls.on_move_on)
 
-    # Throttle to the slower of the requested fps or the camera's own
-    # estimated per-acquisition time -- no point polling faster than the
-    # hardware can actually deliver frames.
-    est_s = cam.estimate_acquire_time()
-    interval_s = max(1.0 / fps, est_s)
-    if interval_s > 1.0 / fps:
-        _log.info("stream(%s): throttling to %.2f fps (exposure/transfer-bound, est=%.3fs)",
-                   label, 1.0 / interval_s, est_s)
+    worker = threading.Thread(
+        target=_acquire_worker, args=(cam, label, controls, acc),
+        name=f"stream-{label}-acquire", daemon=True,
+    )
+    worker.start()
 
-    n = 0
+    plot_interval_s = 0.0 if fps is None else 1.0 / fps
+    n_plotted = 0
     while controls.running and plt.fignum_exists(fig.number):
         loop_start = time.monotonic()
-        if not controls.paused:
-            # DEBUG, not INFO -- at up to 10 fps this would otherwise flood the
-            # console; the per-frame acquire time is shown in the title instead.
-            frame = _timed(f"acquire_single() [stream {label}, frame {n}]",
-                           cam.acquire_single, level=logging.DEBUG)
-            acquire_dt_ms = (time.monotonic() - loop_start) * 1000.0
-            if frame is not None:
-                img = amplitude_channel(frame)
-                im.set_data(img)
-                im.set_clim(img.min(), img.max())
-                n += 1
-            title.set_text(f"{label} | frame {n} | max {img.max():.4g} | acquire {acquire_dt_ms:.1f} ms")
+
+        avg_frame, n_new = acc.pop_average()
+        if avg_frame is not None:
+            last_frame = avg_frame
+            img = amplitude_channel(avg_frame)
+            im.set_data(img)
+            im.set_clim(img.min(), img.max())
+            n_plotted += 1
+        title.set_text(
+            f"{label} | plotted {n_plotted} (avg of {n_new}) | "
+            f"measurement {acc.measurement_fps:.2f} fps | total {acc.total_count}"
+        )
 
         if controls.save_requested:
-            save_frame(out_dir, f"mode3_{label}_frame_{n:04d}", frame)
+            save_frame(out_dir, f"mode3_{label}_frame_{n_plotted:04d}", last_frame)
             controls.save_requested = False
 
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
-        remaining = interval_s - (time.monotonic() - loop_start)
+        remaining = plot_interval_s - (time.monotonic() - loop_start)
         plt.pause(max(remaining, 0.001))
 
+    controls.running = False   # in case the window was closed rather than "Move on" clicked
+    worker.join(timeout=5.0)
+    if worker.is_alive():
+        _log.warning("stream(%s): acquire worker did not stop within 5s", label)
+
+    if acc.total_count > 0:
+        _log.info("stream(%s): %d measurements in %.2fs -- average %.2f fps (measurement rate, GUI-independent)",
+                   label, acc.total_count, time.monotonic() - acc.start_time, acc.measurement_fps)
     plt.close(fig)
 
 
 def mode3_streaming(cam: HeliCamC3, out_dir: str, t_acquire_us: float) -> None:
-    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
+    # Single, clean configure -- no redundant prior set_measurement_mode()
+    # call, no manual set_attributes(), no extra flush(). Isolates whether
+    # n_frames=32 itself is the problem, or whether it was the preceding
+    # back-to-back reconfigure (with SensNFrames changing 256->32) that
+    # broke the second call -- see run 020-024 logs, which all show the
+    # *first* configure succeeding and the *second* one timing out.
+    _timed("set_streaming_params('smooth_amplitude')", cam.set_streaming_params,
+           "smooth_amplitude", n_frames=8)
     _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
-    cam.dump_registers(out_dir, "mode3_registers")
-
-    stream(cam, out_dir, "steady", fps=10.0)
-
-    _timed("set_measurement_mode('amplitude')", cam.set_measurement_mode, "amplitude")
-    stream(cam, out_dir, "amplitude", fps=10.0)
+    cam.dump_registers(out_dir, "mode3_registers_before_amp_stream")
+    stream(cam, out_dir, "smooth_amplitude", fps=1.0)  # 1 Hz redraw -- measurement itself is unthrottled, see stream()'s docstring
 
 
 # ----------------------------------------------------------------------
@@ -768,18 +894,137 @@ def mode7_no_flush_raw(cam: HeliCamC3, out_dir: str, t_old_us: float, t_new_us: 
 
 
 # ----------------------------------------------------------------------
+# Mode 8 -- smooth_amplitude FWHMnFrame effectiveness sweep
+# ----------------------------------------------------------------------
+
+def mode8_fwhm_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float,
+                      fwhm_list, n_repeats: int) -> None:
+    """
+    Does FWHMnFrame's on-device matched filter (manual §5.2.2) actually
+    reduce noise in the final amplitude image, given that data_reformat()
+    already averages the *entire* SensNFrames stack down to one frame
+    regardless of FWHMnFrame (see its CamMode 1/2 docstring in helicam.py)?
+
+    That full-stack average already removes most within-acquisition
+    (frame-to-frame) noise on its own -- averaging commutes with a linear
+    filter applied earlier in the same stack, so a smoothing filter applied
+    before averaging the same full stack should only change the result via
+    edge effects (the filter's own boundary tapering over its first/last
+    few frames, a few percent of SensNFrames=256). Whether that residual
+    effect is big enough to matter can only be settled by measurement, not
+    by reading the register description -- hence this mode.
+
+    Metric: for a CamMode-1 "amplitude" baseline (FWHMnFrame off) and each
+    FWHMnFrame value, acquire ``n_repeats`` *independent* acquisitions
+    back-to-back (same settings, nothing changed in between) and compute
+    the per-pixel std across those repeats -- genuine inter-acquisition
+    noise, the one thing a single acquisition's own full-stack averaging
+    cannot show. If larger FWHMnFrame actually helps, this repeat-to-repeat
+    std should measurably drop as FWHMnFrame increases; if it's flat, the
+    filter isn't buying anything once data_reformat()'s own averaging is
+    already in the pipeline.
+    """
+    _timed("set_measurement_mode('steady')", cam.set_measurement_mode, "steady")
+    _timed("set_gain(1.0)", cam.set_gain, 1.0)
+    _timed(f"set_acquire_time({t_acquire_us})", cam.set_acquire_time, t_acquire_us)
+
+    rows = []
+    mean_images = {}   # label -> mean-over-repeats image, for the summary grid
+
+    def _run_group(label: str, fwhm):
+        if fwhm is None:
+            _timed("set_measurement_mode('amplitude')", cam.set_measurement_mode, "amplitude")
+        else:
+            _timed(f"set_measurement_mode('smooth_amplitude', FWHMnFrame={fwhm})",
+                   cam.set_measurement_mode, "smooth_amplitude", FWHMnFrame=fwhm)
+
+        stack = []
+        for i in range(n_repeats):
+            frame = _timed(f"acquire_single() [{label}, repeat {i}]", cam.acquire_single)
+            if frame is None:
+                _log.warning("Mode 8: %s repeat %d failed, skipping", label, i)
+                continue
+            save_frame(out_dir, f"mode8_{label}_repeat{i}_frame", frame)
+            stack.append(frame)
+
+        if not stack:
+            _log.warning("Mode 8: %s -- all %d repeats failed", label, n_repeats)
+            rows.append({"label": label, "fwhm_n_frame": fwhm, "n_ok": 0,
+                         "mean_amplitude": None, "repeat_noise_std": None})
+            return
+
+        stack = np.stack(stack, axis=0)
+        mean_img = stack.mean(axis=0)
+        repeat_noise = float(stack.std(axis=0).mean()) if len(stack) > 1 else None
+        mean_images[label] = mean_img
+        rows.append({
+            "label": label,
+            "fwhm_n_frame": fwhm,
+            "n_ok": len(stack),
+            "mean_amplitude": float(mean_img.mean()),
+            "repeat_noise_std": repeat_noise,
+        })
+        _log.info("Mode 8: %s -- mean=%.2f, repeat-to-repeat std=%s (n=%d)",
+                   label, mean_img.mean(),
+                   f"{repeat_noise:.3f}" if repeat_noise is not None else "n/a", len(stack))
+
+    _run_group("amplitude_baseline", None)
+    for fwhm in fwhm_list:
+        _run_group(f"fwhm{fwhm}", fwhm)
+
+    save_table(out_dir, "mode8_fwhm_sweep_table", rows)
+    save_json(out_dir, "mode8_params", {
+        "t_acquire_us": t_acquire_us,
+        "fwhm_list": list(fwhm_list),
+        "n_repeats": n_repeats,
+        "gain_DdsGain": cam.get_attribute("DdsGain"),
+        "SensNFrames": cam.SMOOTH_AMPLITUDE_SETTINGS["SensNFrames"],
+    })
+
+    labels = [row["label"] for row in rows]
+    fig1, axes1 = plt.subplots(1, len(labels), figsize=(4 * len(labels), 4))
+    if len(labels) == 1:
+        axes1 = [axes1]
+    for ax, label in zip(axes1, labels):
+        img = mean_images.get(label)
+        if img is not None:
+            im = ax.imshow(img, cmap="gray")
+            fig1.colorbar(im, ax=ax)
+        ax.set_title(label)
+    fig1.suptitle(f"Mode 8: FWHMnFrame sweep, mean of {n_repeats} repeats each (t={t_acquire_us:g}us)")
+    fig1.savefig(os.path.join(out_dir, "mode8_frames_summary.png"))
+
+    swept = [row for row in rows if row["fwhm_n_frame"] is not None and row["repeat_noise_std"] is not None]
+    baseline = next((row for row in rows if row["fwhm_n_frame"] is None), None)
+
+    fig2, ax2 = plt.subplots(figsize=(6, 4))
+    ax2.plot([row["fwhm_n_frame"] for row in swept], [row["repeat_noise_std"] for row in swept], "o-",
+              label="smooth_amplitude")
+    if baseline is not None and baseline["repeat_noise_std"] is not None:
+        ax2.axhline(baseline["repeat_noise_std"], color="gray", linestyle="--",
+                     label="amplitude baseline (no filter)")
+    ax2.set_xlabel("FWHMnFrame (0=off, 1=2fr, 2=6fr, 3=10fr, 4=20fr)")
+    ax2.set_ylabel("repeat-to-repeat std (mean over image)")
+    ax2.set_title("Mode 8: does FWHMnFrame reduce inter-acquisition noise?")
+    ax2.legend()
+    fig2.savefig(os.path.join(out_dir, "mode8_noise_vs_fwhm.png"))
+    plt.show()
+
+
+# ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6, 7], required=True,
+    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8], required=True,
                          help="1=lifecycle/exposure-gain, 2=lock-in detection, 3=streaming, "
                               "4=auto_expose() checkout, 5=SensNFrames sweep, "
-                              "6=SensExpRatio sweep, 7=no-flush raw sequence")
+                              "6=SensExpRatio sweep, 7=no-flush raw sequence, "
+                              "8=smooth_amplitude FWHMnFrame effectiveness sweep")
     parser.add_argument("--sys-id", type=str, default="c3cam_sl70")
     parser.add_argument("--t-acquire-us", type=float, default=DEFAULT_T_ACQUIRE_US,
-                         help="Starting exposure time in microseconds, modes 2/3 (default: %(default)s)")
+                         help="Starting exposure time in microseconds, modes 2/3/8 (default: %(default)s)")
     parser.add_argument("--target-fraction", type=float, default=0.5,
                          help="auto_expose() target fraction of the way to the detected "
                               "saturation onset, mode 4 (default: %(default)s)")
@@ -809,6 +1054,9 @@ def main():
         elif args.mode == 7:
             mode7_no_flush_raw(cam, out_dir, DEFAULT_MODE7_T_OLD_US, DEFAULT_MODE7_T_NEW_US,
                                 DEFAULT_MODE7_SENSNFRAMES, DEFAULT_MODE7_N_ACQUISITIONS)
+        elif args.mode == 8:
+            mode8_fwhm_sweep(cam, out_dir, args.t_acquire_us,
+                              DEFAULT_MODE8_FWHM_LIST, DEFAULT_MODE8_N_REPEATS)
 
         cam.dump_registers(out_dir)
 

@@ -167,7 +167,6 @@ and Ctrl-C. Partial data is flushed before teardown.
 heliCam specifics:
 - Mode switching (intensity ↔ lock-in) is a config change, not a per-frame flag. Wrap it with
   an explicit settling delay; do not assume the next frame is valid.
-- Expose `arm(n_demod, phi_us)`, `read_frame() -> (I, Q)`, `set_demod_clock(external=True)`.
 - Log the measured readout time and minimum retrigger latency at startup.
 
 ### 5.4 Invariants — assert at startup, fail loud

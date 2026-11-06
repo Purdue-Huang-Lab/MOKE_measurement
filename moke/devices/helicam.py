@@ -136,6 +136,17 @@ class HeliCamC3(Device):
         # value -- a 385-frame raw IQ volume instead of a small test
         # acquisition. Override via set_measurement_mode("rawIQ", SensNFrames=...).
         "SensNFrames":   256,
+        # Same silent-inheritance footgun as SensNFrames, but for the
+        # trigger source: without this, rawIQ mode would inherit whatever
+        # TrigFreeExtN was last left at. TrigFreeExtN=0 means "acquisition
+        # controlled by an external trigger source" (register description,
+        # AcqCtrl 0x02) -- with nothing physically wired to trigger it,
+        # Acquire() blocks until HeliCamC3's fixed timeout_ms and returns
+        # -116 ("timeout or no trigger"), confirmed on real hardware.
+        # TrigFreeExtN is unrelated to the on-sensor demodulation reference
+        # (SensTqp/SensNavM2, set_demod_clock()) -- it only governs what
+        # starts an acquisition, not the lock-in frequency.
+        "TrigFreeExtN":  1,
         # OffsetMethod does NOT apply to CamMode 0 (register description
         # §2.18, OffsetProc's CamMode column is "1,2,4,5,7") -- rawIQ
         # always returns raw, uncorrected ADC counts regardless of this
@@ -149,12 +160,22 @@ class HeliCamC3(Device):
         # switching into amplitude mode after "steady" (SensNFrames=256)
         # would silently inherit whatever was last set.
         "SensNFrames":   256,
+        # See RAWIQ_SETTINGS's comment -- without this, amplitude mode can
+        # silently inherit TrigFreeExtN=0 and hang every acquisition until
+        # timeout (confirmed on real hardware for smooth_amplitude, same
+        # register applies here).
+        "TrigFreeExtN":  1,
         "OffsetMethod":  0,
     }
 
     SMOOTH_AMPLITUDE_SETTINGS = {
         "CamMode":       2,
         "SensNFrames":   256,
+        # See RAWIQ_SETTINGS's comment -- confirmed on real hardware: with
+        # TrigFreeExtN left at 0 (inherited from an earlier, unrelated
+        # register write), every smooth_amplitude acquisition timed out
+        # (-116, "timeout or no trigger") instead of completing.
+        "TrigFreeExtN":  1,
         "FWHMnFrame":    2      # FWHM for signal envelope. 0 - no filter; 1 - 2 frame; 2 - 6 frames, 3 - 10, 4 - 20
     }
 
@@ -597,7 +618,11 @@ class HeliCamC3(Device):
             base = dict(self.STEADY_SETTINGS)
             cam_mode = 3
         elif modedesc in minimum_energy_alias:
-            base = {"CamMode": 7, "AcqStop": 0}
+            # TrigFreeExtN=1 for the same reason as RAWIQ_SETTINGS/
+            # AMPLITUDE_SETTINGS/SMOOTH_AMPLITUDE_SETTINGS -- without it,
+            # this mode can silently inherit TrigFreeExtN=0 and hang every
+            # acquisition until timeout.
+            base = {"CamMode": 7, "AcqStop": 0, "TrigFreeExtN": 1}
             cam_mode = 7
         elif modedesc in rawIQ_alias:
             base = dict(self.RAWIQ_SETTINGS)
@@ -685,6 +710,15 @@ class HeliCamC3(Device):
                     round(base), mult, round(base) * (mult + 1),
                 )
                 return
+
+    def set_n_frame(self, n_frames:int):
+        """
+        Helper function to set the number of frames to acquire in a measurement.
+        TODO: need documentation.
+        """
+        self.set_attributes(SensNFrames=n_frames)
+        _log.info("Set number of frames to acquire to %d", n_frames)
+        
 
     def set_gain(self, analogue_gain=1):
         """
@@ -878,6 +912,81 @@ class HeliCamC3(Device):
         if count == 0:
             return None
         return acc / count
+
+    def set_streaming_params(self, mode: str, n_frames: int = None, warmup: bool = True, **kwargs) -> None:
+        """
+        Configure the camera for repeated fast reads via ``acquire_light()``.
+
+        Thin wrapper around ``set_measurement_mode()`` -- reuses its mode-alias
+        vocabulary, AcqStop halt/restart sequencing, ``AllocCamData``, and
+        settling-artifact warm-up unchanged. Pair with ``acquire_light()`` for
+        the actual repeated reads: unlike ``acquire_single()``/``acquire_avg()``,
+        ``acquire_light()`` does not flush() before every call, which is what
+        keeps repeated reads fast once armed here (see ``acquire_light()``'s
+        docstring for why that's safe only between calls that don't change
+        registers).
+
+        Parameters
+        ----------
+        mode:
+            Measurement-mode alias, exactly ``set_measurement_mode()``'s
+            vocabulary ("steady", "rawIQ", "amplitude", "smooth_amplitude",
+            "minimum_energy").
+        n_frames:
+            Overrides SensNFrames. None (default) inherits the target
+            mode's own settings dict (e.g. 256 for "steady"/"amplitude").
+        warmup:
+            Passed through to ``set_measurement_mode()`` -- discards one
+            throwaway acquisition right after configuring, to clear the
+            mode-switch settling artifact. Paid once here, not per
+            ``acquire_light()`` call.
+        **kwargs:
+            Forwarded to ``set_measurement_mode()`` -- any other mode-specific
+            register override.
+        """
+        self._require_open("set_streaming_params")
+        settings = dict(kwargs)
+        if n_frames is not None:
+            settings["SensNFrames"] = n_frames
+        self.set_measurement_mode(mode, warmup=warmup, **settings)
+
+    def acquire_light(self):
+        """
+        Read one frame without flushing first.
+
+        Pair with ``set_streaming_params()`` (or a plain
+        ``set_measurement_mode()`` call) for fast repeated acquisition --
+        safe only between calls where nothing has changed registers since
+        the last mode/settings change (matches mode 7's empirical finding,
+        ``helicamC3_practical_knowledge_base.md``, that a flush is only
+        needed right after a mode/settings change, not between repeats of
+        the same settings). Contrast ``acquire_single()``, which flushes
+        every call and is the slow path this method exists to replace for
+        continuous acquisition -- GUI-driven or headless.
+
+        Returns
+        -------
+        Whatever ``data_reformat()`` returns for the currently configured
+        mode (see its docstring) -- shape/dtype/type depends on CamMode,
+        same as ``acquire_single()``'s return value. None if the
+        acquisition timed out or missed its trigger.
+
+        Raises
+        ------
+        RuntimeError
+            If the camera is not open, or no measurement mode has been
+            configured yet.
+        """
+        self._require_open("acquire_light")
+        if getattr(self, "_current_cammode", None) is None:
+            raise RuntimeError(
+                "acquire_light: no measurement mode configured -- call "
+                "set_streaming_params() or set_measurement_mode() first"
+            )
+        data = self._acquire()
+        if data is None:
+            return None
+        return self.data_reformat(data)
 
     def null_offset(self, n_acquisitions: int = 10) -> tuple[np.ndarray, np.ndarray]:
         """
