@@ -1,6 +1,121 @@
-# TODO / handoff — heliCam C3 driver work (updated 2026-08-12)
+# TODO / handoff — heliCam C3 driver work (updated 2026-11-17)
 
-## RESUME HERE — first thing to discuss next session
+## RESUME HERE (2026-11-17) — first lock-in test: locked, but residual signal unexplained
+
+### Bench setup used
+- 632.8 nm cw laser, polarized 0° → PEM (Hinds) axis 45° → QWP 45° (parallel
+  to PEM) → analyzer 90° → heliCam. Hand-aligned, ~3–5° angle errors. Beam
+  **loosely focused** on the sensor (spot ≈ 35 px at half max).
+- Ideal signal: `I = I0/2·[1 + 2J1(A)·sin ωt + 2J3(A)·sin 3ωt …]` → pure 1f.
+- PEM: RTD 0.293 waves (A = 1.84 rad, J1 maximum), 1f = 50.023 kHz.
+  **Controller WAV was 658 nm, not 632.8** → real retardation ≈ 0.305 waves.
+  Harmless here (J1 flat), fix before real MOKE work.
+- PEM **2f** reference → heliDriver **encoder** input (pins/channel not yet
+  written down — record them).
+
+### What `helicam_test.py --mode 9` actually tests (uncommitted)
+Two rawIQ (CamMode 0) bursts, identical except the demod clock:
+`SensNFrames=16, SensNavM2=255, BSEnable=1, CalDur1Cyc=1, DdsGain=2,
+TrigFreeExtN=1`, 6 acquisitions each, no flush between them.
+1. **Internal clock** (`ExtTqp=0, SensTqp=29` → fd = 148.3 kHz). The 50 kHz
+   optical signal is not at fd, so this burst carries no demodulated signal.
+   Used for two things: (a) calibrating USB/readout overhead per frame for
+   the timing model; (b) its frame-average is taken as the per-pixel I/Q
+   **offset map**.
+2. **External clock** (`ExtTqp=1, ExtTqpPuls=1, SensTqp=29`). `SensTqp` now
+   only sets per-sample integration: (29+11)/35 MHz = 1.1 µs of each 5 µs
+   quarter (~23 % duty — deliberately short, see below).
+
+Then it reports:
+- **Timing → fd.** Per-frame time `Tfr = (Nc+1)/fd`, `Nc = 2·SensNavM2+2`
+  (validated on run 037). Wall time per acquisition = 16·(Tfr + USB
+  overhead from burst 1) → estimated external fd. Three hypotheses:
+  fd = f_PEM (2f in, edges on both flanks → f_in/2), fd = 2f_PEM, or 148 kHz
+  (ExtTqp ignored). `SensTqp=29` makes "ignored" land far from both.
+- **|z| map**, `z = (I − I0) + i(Q − Q0)` with offsets from burst 1.
+- **Coherence** per pixel = |mean_frames z| / mean_frames |z| → 1 for a
+  stationary (locked) vector, ~1/√16 = 0.25 for noise. **Caveat:** a
+  constant offset error is also perfectly "coherent", so coherence alone
+  cannot separate a locked signal from an internal-vs-external offset
+  mismatch. The background stripes / left-right split in the coherence map
+  are exactly that mismatch (a few counts).
+- **ROI phase per acquisition** — a ~π jump would mean acquisitions start on
+  random rising/falling edges.
+- **VERDICT line** is based on coherence in a ROI = pixels with |z| > 3×
+  internal p99. Weak logic (see caveat); don't trust it on its own.
+- Always restores `ExtTqp=0` on exit.
+
+### Results (data: `F:\OneDrive - purdue.edu\temp_helicam_test\lockin`, runs `on1`, `mod0_1`)
+- **Clock locked to the PEM reference — confirmed.** ExtTqp free-runs with
+  `TrigFreeExtN=1` (no start trigger needed). fd from timing = 52.9 / 51.8 kHz
+  ≈ 1.05 × f_PEM (322–334 ms/acq measured vs 331–340 predicted for fd = f_PEM,
+  249–258 for 2f_PEM, 222–231 for internal). So the f_in/2 reading of manual
+  §4.4 is right. PEM fully off → acquisitions error out (no reference pulses
+  → no frames), consistent.
+- **Optical lock-in signal — confirmed.** At the spot: peak |z| **196**
+  counts (PEM on) vs **19** (RTD = 0), ×10.3. Offset-free comparison (on run
+  minus mod0 run, same config): 207 counts vs ~0.5 noise. Phase at the peak
+  pixel 2.93 ± 0.01 rad over 16 frames, 2.68–2.99 across 6 acquisitions — no
+  π jumps.
+- Lesson (again, knowledge base §9): **evaluate at the spot/peak**. My first
+  reading used whole-frame mean/p99 and wrongly concluded "no signal" — the
+  spot is 0.04 % of the frame.
+
+### Open — residual at RTD = 0 (~10 % of signal)
+At the spot, relative to the internal-clock offset map:
+
+| run | spot-mean \|z\| | phase |
+|---|---|---|
+| PEM on (RTD 0.293) | 139.6 | 2.80 rad |
+| RTD = 0 | 12.2 | **1.57 rad** |
+
+The residual is **not a scaled copy of the signal** (phase differs by ~1.2
+rad), so it is likely ≥2 contributions. Candidates:
+1. Internal-vs-external **offset mismatch that scales with DC light** (the two
+   configs sample/integrate differently, BSEnable residual depends on light)
+   — would appear only where the beam is, like this residual does.
+2. Real 1f modulation left at RTD = 0: PEM crystal still driven/strained,
+   static birefringence of PEM/QWP/analyzer mixing with a residual
+   retardation.
+3. Electrical pickup from the PEM drive/reference at 50 kHz — but pickup
+   wouldn't be spot-shaped, so less likely.
+
+To separate them:
+- [ ] **Beam blocked, ExtTqp on** → true external-clock offset map. Then
+      `mod0 − blocked` = real residual with no offset mismatch, `on − blocked`
+      = full signal. If `mod0 − blocked` ≈ 0 → it was candidate 1.
+- [ ] Residual vs light level (ND filters): offset artefact scales with DC
+      intensity; a real modulation term also does — compare phase stability.
+- [ ] Rotate the analyzer 90°→0°: real 1f flips sign (phase +π); an offset
+      artefact does not.
+- [ ] Remove the QWP at RTD = 0: no bias → any remaining 1f term isn't from
+      the J1 path.
+
+### Next measurement
+- [ ] **Expand the beam** to fill a good part of the sensor (11.9 mm field),
+      ND as needed. Watch clipping: raw I/Q at the spot already swung to
+      ~390 from a ~600 baseline at 196 counts amplitude.
+- [ ] Rerun mode 9: `--note pem_on`, then RTD = 0 `--note pem_mod0`, then beam
+      blocked `--note blocked` (needed for the residual analysis above).
+- [ ] Also try `--ext-sens-tqp 140` (integration ≈ full 5 µs quarter, ~4×
+      more signal; keep < 164).
+- [ ] Record encoder D-sub pins / channel used, and set PEM WAV to 632.8.
+
+### Code follow-ups for mode 9
+- [ ] Replace whole-frame stats with spot/peak stats (threshold on the
+      signal itself, e.g. > ½ max), and print peak |z|.
+- [ ] Verdict from an **on vs off/blocked comparison** (offset-free), not
+      coherence against the internal-clock offset map.
+- [ ] Optional third burst: internal clock at `SensTqp=145` (exactly 50.000
+      kHz, 23 Hz from the PEM) → I/Q should rotate ~3.7 turns per
+      acquisition. Independent check of optics + demod without ExtTqp.
+- [ ] First frame of each acquisition reads ~10 % high (225 vs ~206 at the
+      peak) — note/investigate settling.
+- [ ] Commit mode 9 once the above is settled (currently uncommitted).
+
+---
+
+## Previous resume note (2026-11-06)
 
 Stopped mid-investigation on mode 3 (live streaming) — see §6 below for the
 full writeup. Short version of where it's at:
