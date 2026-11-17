@@ -20,6 +20,7 @@ Usage::
     python -m moke.devices.helicam_test --mode 6
     python -m moke.devices.helicam_test --mode 7
     python -m moke.devices.helicam_test --mode 8
+    python -m moke.devices.helicam_test --mode 9 --f-pem-hz 50023 --note pem_on
 
 Mode 1 -- lifecycle / exposure characterization:
     open -> steady mode -> gain=1x (best SNR, DdsGain=2) -> acquire across a
@@ -100,6 +101,14 @@ Mode 8 -- smooth_amplitude FWHMnFrame effectiveness sweep:
     the on-device matched filter buys anything beyond that Python-side
     averaging is an open, TODO.md #3, empirical question -- this mode is
     how to answer it on real hardware.
+
+Mode 9 -- ExtTqp lock check (PEM 2f reference on the heliDriver encoder input):
+    rawIQ burst on the internal clock (reference + offset map), then the
+    same burst with ExtTqp=1. Estimates the external demod frequency from
+    acquisition timing and checks that the demodulated I/Q vector is
+    coherent frame-to-frame (locked) rather than noise. Restores ExtTqp=0
+    afterwards. Rerun with the PEM retardation at 0 and --note pem_off as
+    the control. See mode9_exttqp_lock()'s docstring.
 
 This script owns all visualization/GUI/file-IO weight -- ``helicam.py``
 stays a plain (non-GUI) device driver; see device_interface_instruction.md.
@@ -1011,16 +1020,242 @@ def mode8_fwhm_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float,
 
 
 # ----------------------------------------------------------------------
+# Mode 9 -- ExtTqp lock check (PEM reference on the heliDriver encoder input)
+# ----------------------------------------------------------------------
+
+F_SENSOR_HZ = 70e6
+
+
+def _rawiq_burst(cam: HeliCamC3, label: str, n_acq: int, settings: dict):
+    """
+    Configure rawIQ with ``settings``, then time ``n_acq`` back-to-back
+    acquisitions (no flush in between). Returns (list of (n, H, W, 2) int16
+    volumes, list of per-acquisition wall times in ms). Stops early after 2
+    consecutive failures so a dead ExtTqp input costs seconds, not minutes.
+    """
+    _timed(f"set_measurement_mode('rawIQ') [{label}]", cam.set_measurement_mode, "rawIQ", **settings)
+    vols, t_ms = [], []
+    n_fail = 0
+    for i in range(n_acq):
+        t0 = time.perf_counter()
+        data = cam._acquire()
+        dt = (time.perf_counter() - t0) * 1000.0
+        if data is None:
+            n_fail += 1
+            _log.warning("Mode 9 [%s]: acquisition %d failed after %.0f ms", label, i, dt)
+            if n_fail >= 2:
+                _log.warning("Mode 9 [%s]: 2 consecutive failures, giving up on this config", label)
+                break
+            continue
+        n_fail = 0
+        vols.append(cam.crop_unphysical(data).view(np.int16).copy())
+        t_ms.append(dt)
+        _log.info("Mode 9 [%s]: acquisition %d -> %.1f ms", label, i, dt)
+    return vols, t_ms
+
+
+def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
+                      ext_sens_tqp: int, note: str) -> None:
+    """
+    Is the lock-in actually locked to the PEM reference on the encoder input?
+
+    Two rawIQ (CamMode 0) bursts with identical settings except the clock:
+      1. internal clock (ExtTqp=0, SensTqp=29 -> fd=148.3 kHz): known-good
+         reference. Calibrates the per-frame USB overhead for the timing
+         model, and -- because the 50 kHz optical signal isn't at fd or an
+         odd harmonic of it -- its frame-averaged I/Q is a free per-pixel
+         offset map (no modulated signal demodulated).
+      2. external clock (ExtTqp=1, ExtTqpPuls=1 so either encoder channel A
+         or B works, TrigFreeExtN=1 free-running).
+
+    Evidence it's locked, from independent angles:
+      * Timing: per-frame time Tfr = (Nc+1)/fd with Nc = 2*SensNavM2+2
+        (BSEnable=1, CalDur1Cyc=1; confirmed by run 037). With SensNavM2=255
+        the sensor time dominates, so wall time per acquisition is an fd
+        meter. Prediction: fd = f_in/2 = f_PEM (2f reference in), or f_in =
+        2 f_PEM if my reading of manual §4.4 is wrong, or 148.3 kHz if
+        ExtTqp were silently ignored.
+      * Coherence: with a locked reference the demodulated (I,Q) vector is
+        the same every frame, so per pixel |mean(z)| / mean(|z|) -> 1.
+        Unlocked or no signal -> ~1/sqrt(n_frames). z = (I - I0) + i(Q - Q0),
+        offsets from burst 1.
+      * Control (manual, rerun with --note pem_off): set PEM retardation to 0
+        -- the coherent amplitude must collapse while the timing stays.
+
+    SensTqp=29 is deliberate for the timing test: in ExtTqp mode it only sets
+    the per-sample integration length ((29+11)/35 MHz = 1.1 us, inside the
+    5 us half-period of a 100 kHz reference), and it makes "ExtTqp ignored"
+    land at 148.3 kHz -- far from both lock hypotheses. It also gives both
+    bursts the same integration length, so burst 1's offset map applies.
+    """
+    sens_nav_m2, n_frames = 255, 16
+    nc = 2 * sens_nav_m2 + 2
+    common = {
+        "SensNFrames": n_frames, "SensNavM2": sens_nav_m2, "BSEnable": 1, "CalDur1Cyc": 1,
+        "DdsGain": 2, "TrigFreeExtN": 1,
+    }
+    int_settings = {**common, "SensTqp": 29, "ExtTqp": 0, "ExtTqpPuls": 0}
+    ext_settings = {**common, "SensTqp": ext_sens_tqp, "ExtTqp": 1, "ExtTqpPuls": 1}
+    if (ext_sens_tqp + 11) / 35e6 >= 0.5 / (2 * f_pem_hz):
+        _log.warning("Mode 9: SensTqp=%d integrates %.2f us, >= the 2f reference half-period %.2f us "
+                     "(manual §4.4 constraint)", ext_sens_tqp, (ext_sens_tqp + 11) / 35e6 * 1e6,
+                     0.5 / (2 * f_pem_hz) * 1e6)
+
+    int_vols, int_t = _rawiq_burst(cam, "internal", n_acq, int_settings)
+    try:
+        ext_vols, ext_t = _rawiq_burst(cam, "external", n_acq, ext_settings)
+        cam.dump_registers(out_dir, "mode9_registers_external")
+    finally:
+        # Never leave the camera on ExtTqp -- every later mode would stall
+        # (or silently run off the PEM) without knowing why.
+        cam.set_attributes(AcqStop=1, ExtTqp=0, ExtTqpPuls=0)
+        cam.set_attributes(AcqStop=0)
+        _log.info("Mode 9: restored ExtTqp=0")
+
+    if not int_vols:
+        _log.error("Mode 9: internal-clock reference failed entirely -- camera problem, not ExtTqp")
+        return
+    np.save(os.path.join(out_dir, "mode9_internal_raw0.npy"), int_vols[0])
+    if ext_vols:
+        np.save(os.path.join(out_dir, "mode9_external_raw0.npy"), ext_vols[0])
+
+    # --- Timing -> fd estimate. Skip the first acquisition (may be a volume
+    # already sitting in camera memory, so it returns early).
+    def _median_steady(ts):
+        return float(np.median(ts[1:] if len(ts) > 1 else ts))
+
+    fd_int = F_SENSOR_HZ / (8 * (29 + 30))
+    tfr_int = (nc + 1) / fd_int
+    t_int = _median_steady(int_t) / 1000.0
+    t_usb = t_int / n_frames - tfr_int
+    _log.info("Mode 9: internal %.1f ms/acq -> USB+overhead %.2f ms/frame (Tfr %.2f ms at %.1f kHz)",
+              t_int * 1e3, t_usb * 1e3, tfr_int * 1e3, fd_int / 1e3)
+
+    predictions = {
+        "fd=f_PEM (f_in/2, expected)": f_pem_hz,
+        "fd=2f_PEM (f_in)": 2 * f_pem_hz,
+        "ExtTqp ignored (internal)": F_SENSOR_HZ / (8 * (ext_sens_tqp + 30)),
+    }
+    for name, fd in predictions.items():
+        _log.info("Mode 9: prediction %-30s fd=%8.1f Hz -> %.1f ms/acq",
+                  name, fd, n_frames * ((nc + 1) / fd + t_usb) * 1e3)
+
+    fd_ext_est = None
+    if ext_t:
+        t_ext = _median_steady(ext_t) / 1000.0
+        tfr_ext = t_ext / n_frames - t_usb
+        fd_ext_est = (nc + 1) / tfr_ext if tfr_ext > 0 else None
+        _log.info("Mode 9: external %.1f ms/acq -> estimated fd = %s", t_ext * 1e3,
+                  f"{fd_ext_est:.0f} Hz ({fd_ext_est / f_pem_hz:.3f} x f_PEM)" if fd_ext_est else "n/a")
+    else:
+        _log.warning("Mode 9: NO external acquisitions succeeded. Either no pulses reach the encoder "
+                     "input (wiring / channel / signal level), or ExtTqp needs TrigFreeExtN=0 plus a "
+                     "start pulse on the trigger BNC.")
+
+    # --- Coherence / signal, relative to the internal burst's offset map.
+    offset = np.concatenate(int_vols, axis=0).astype(np.float64).mean(axis=0)   # (H, W, 2)
+
+    def _lock_stats(vols):
+        rows = []
+        amp_maps, coh_maps, phase_maps = [], [], []
+        for k, v in enumerate(vols):
+            d = v.astype(np.float64) - offset
+            z = d[..., 0] + 1j * d[..., 1]                     # (n, H, W)
+            m = z.mean(axis=0)
+            amp = np.abs(m)
+            coh = amp / np.maximum(np.abs(z).mean(axis=0), 1e-9)
+            amp_maps.append(amp); coh_maps.append(coh); phase_maps.append(np.angle(m))
+            rows.append({"acq": k, "mean_amp": float(amp.mean()), "p99_amp": float(np.percentile(amp, 99))})
+        return rows, np.mean(amp_maps, 0), np.mean(coh_maps, 0), phase_maps
+
+    int_rows, int_amp, int_coh, _ = _lock_stats(int_vols)
+    coh_floor = 1.0 / np.sqrt(n_frames)
+    _log.info("Mode 9: internal (no-signal reference): mean |z| %.2f counts, coherence median %.2f "
+              "(random-noise floor ~%.2f)", int_amp.mean(), np.median(int_coh), coh_floor)
+
+    summary = {
+        "note": note, "f_pem_hz": f_pem_hz, "n_acq": n_acq, "SensNFrames": n_frames,
+        "SensNavM2": sens_nav_m2, "ext_SensTqp": ext_sens_tqp,
+        "internal_ms_per_acq": int_t, "external_ms_per_acq": ext_t,
+        "usb_overhead_ms_per_frame": t_usb * 1e3, "fd_ext_estimate_hz": fd_ext_est,
+        "predictions_hz": predictions,
+        "internal_mean_amp": float(int_amp.mean()), "internal_coherence_median": float(np.median(int_coh)),
+    }
+
+    if ext_vols:
+        ext_rows, ext_amp, ext_coh, ext_phases = _lock_stats(ext_vols)
+        # Signal ROI: pixels clearly above the internal-reference noise.
+        thresh = np.percentile(int_amp, 99) * 3
+        roi = ext_amp > thresh
+        n_roi = int(roi.sum())
+        raw_all = np.concatenate(ext_vols, axis=0)
+        clip_frac = float(((raw_all <= 2) | (raw_all >= 1021)).mean())
+        acq_phase = [float(np.angle(np.exp(1j * p[roi]).mean())) if n_roi else None for p in ext_phases]
+        _log.info("Mode 9: external: mean |z| %.2f counts, %d px above 3x internal p99 (%.1f), "
+                  "coherence median %.2f overall / %s in ROI, clipped raw fraction %.4f",
+                  ext_amp.mean(), n_roi, thresh, np.median(ext_coh),
+                  f"{np.median(ext_coh[roi]):.2f}" if n_roi else "n/a", clip_frac)
+        _log.info("Mode 9: ROI phase per acquisition [rad]: %s  (a jump of ~pi between acquisitions "
+                  "= start-on-rising vs falling edge)", [None if p is None else round(p, 2) for p in acq_phase])
+        if n_roi and np.median(ext_coh[roi]) > 0.8:
+            _log.info("Mode 9: VERDICT -- coherent, stationary demodulated signal: consistent with LOCKED. "
+                      "Confirm with a --note pem_off rerun (amplitude should collapse).")
+        else:
+            _log.info("Mode 9: VERDICT -- no coherent signal above the reference. Not locked, no light "
+                      "modulation reaching the sensor, or the PEM is off.")
+        for r, p in zip(ext_rows, acq_phase):
+            r["roi_phase_rad"] = p
+        save_table(out_dir, "mode9_external_per_acq", ext_rows)
+        np.save(os.path.join(out_dir, "mode9_external_amp.npy"), ext_amp)
+        np.save(os.path.join(out_dir, "mode9_external_coherence.npy"), ext_coh)
+        np.save(os.path.join(out_dir, "mode9_offset_from_internal.npy"), offset)
+        summary.update({
+            "external_mean_amp": float(ext_amp.mean()), "external_coherence_median": float(np.median(ext_coh)),
+            "roi_pixels": n_roi, "roi_threshold": float(thresh),
+            "roi_coherence_median": float(np.median(ext_coh[roi])) if n_roi else None,
+            "roi_phase_per_acq_rad": acq_phase, "clipped_raw_fraction": clip_frac,
+        })
+
+        fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+        im = axes[0].imshow(int_amp, cmap="magma"); fig.colorbar(im, ax=axes[0])
+        axes[0].set_title("internal |z| (no-signal reference)")
+        im = axes[1].imshow(ext_amp, cmap="magma"); fig.colorbar(im, ax=axes[1])
+        axes[1].set_title("external |z| [counts]")
+        im = axes[2].imshow(ext_coh, cmap="viridis", vmin=0, vmax=1); fig.colorbar(im, ax=axes[2])
+        axes[2].set_title(f"external coherence (noise floor ~{coh_floor:.2f})")
+        ph = np.where(roi, ext_phases[0], np.nan)
+        im = axes[3].imshow(ph, cmap="twilight", vmin=-np.pi, vmax=np.pi); fig.colorbar(im, ax=axes[3])
+        axes[3].set_title("external phase, acq 0 (ROI only)")
+        fd_txt = f"{fd_ext_est / 1e3:.2f} kHz" if fd_ext_est else "n/a"
+        fig.suptitle(f"Mode 9 ExtTqp lock check [{note}] -- f_PEM={f_pem_hz / 1e3:.3f} kHz, "
+                     f"estimated fd={fd_txt}")
+        fig.savefig(os.path.join(out_dir, "mode9_summary.png"))
+
+    save_json(out_dir, "mode9_summary", summary)
+    plt.show()
+
+
+# ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8], required=True,
+    parser.add_argument("--mode", type=int, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9], required=True,
                          help="1=lifecycle/exposure-gain, 2=lock-in detection, 3=streaming, "
                               "4=auto_expose() checkout, 5=SensNFrames sweep, "
                               "6=SensExpRatio sweep, 7=no-flush raw sequence, "
-                              "8=smooth_amplitude FWHMnFrame effectiveness sweep")
+                              "8=smooth_amplitude FWHMnFrame effectiveness sweep, "
+                              "9=ExtTqp lock check (PEM reference on encoder input)")
+    parser.add_argument("--f-pem-hz", type=float, default=50023.0,
+                         help="PEM 1f frequency from the controller display, mode 9 (default: %(default)s)")
+    parser.add_argument("--n-acq", type=int, default=6,
+                         help="Acquisitions per clock config, mode 9 (default: %(default)s)")
+    parser.add_argument("--ext-sens-tqp", type=int, default=29,
+                         help="SensTqp (per-sample integration length) in ExtTqp mode, mode 9 "
+                              "(default: %(default)s; must keep (SensTqp+11)/35MHz < reference half-period)")
+    parser.add_argument("--note", type=str, default="pem_on",
+                         help="Free-text label saved with mode 9 results, e.g. pem_on / pem_off")
     parser.add_argument("--sys-id", type=str, default="c3cam_sl70")
     parser.add_argument("--t-acquire-us", type=float, default=DEFAULT_T_ACQUIRE_US,
                          help="Starting exposure time in microseconds, modes 2/3/8 (default: %(default)s)")
@@ -1056,6 +1291,8 @@ def main():
         elif args.mode == 8:
             mode8_fwhm_sweep(cam, out_dir, args.t_acquire_us,
                               DEFAULT_MODE8_FWHM_LIST, DEFAULT_MODE8_N_REPEATS)
+        elif args.mode == 9:
+            mode9_exttqp_lock(cam, out_dir, args.f_pem_hz, args.n_acq, args.ext_sens_tqp, args.note)
 
         cam.dump_registers(out_dir)
 
