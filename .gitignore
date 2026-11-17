@@ -185,3 +185,60 @@ cython_debug/
 
 # test code
 /moke/devices/helicam_test_data/
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_amplitude_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_params.json
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_rawiq_amplitude.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_rawiq_I.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_rawiq_phase.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_rawiq_Q.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_registers_at_start.json
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_smooth_amplitude_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_steady_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode-2/mode2_summary.png
+moke/devices/helicam_test_data/260811-lockin mode-2/registers.json
+moke/devices/helicam_test_data/260811-lockin mode-2/run_log.txt
+moke/devices/helicam_test_data/260811-lockin mode/mode2_amplitude_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_params.json
+moke/devices/helicam_test_data/260811-lockin mode/mode2_rawiq_amplitude.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_rawiq_I.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_rawiq_phase.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_rawiq_Q.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_registers_at_start.json
+moke/devices/helicam_test_data/260811-lockin mode/mode2_smooth_amplitude_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_steady_frame.npy
+moke/devices/helicam_test_data/260811-lockin mode/mode2_summary.png
+moke/devices/helicam_test_data/260811-lockin mode/registers.json
+moke/devices/helicam_test_data/260811-lockin mode/run_log.txt
+moke/devices/helicam_test_data/_key_helicam_test_016/32frame-1usMeasure-1p0Gain-c1.png
+moke/devices/helicam_test_data/_key_helicam_test_016/32frame-1usMeasure-1p0Gain.png
+moke/devices/helicam_test_data/_key_helicam_test_016/dark_ref.npy
+moke/devices/helicam_test_data/_key_helicam_test_016/in_run_frame.npy
+moke/devices/helicam_test_data/_key_helicam_test_016/run_log.txt
+moke/devices/helicam_test_data/_key_helicam_test_016/useful.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_frames_summary.png
+moke/devices/helicam_test_data/good_mode5_test/mode5_frames_sweep_table.csv
+moke/devices/helicam_test_data/good_mode5_test/mode5_n102_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n128_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n161_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n203_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n256_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n32_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n40_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n51_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n64_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_n81_frame.npy
+moke/devices/helicam_test_data/good_mode5_test/mode5_peak_intensity.png
+moke/devices/helicam_test_data/good_mode5_test/registers.json
+moke/devices/helicam_test_data/good_mode5_test/run_log.txt
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_amplitude_frame.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_params.json
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_rawiq_amplitude.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_rawiq_I.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_rawiq_phase.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_rawiq_Q.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_registers_at_start.json
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_smooth_amplitude_frame.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_steady_frame.npy
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/mode2_summary.png
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/registers.json
+moke/devices/helicam_test_data/helicam_test_000_selfoffset/run_log.txt
