@@ -1,9 +1,103 @@
-# TODO / handoff — heliCam C3 driver work (updated 2026-11-17)
+# TODO / handoff — heliCam C3 driver work (updated 2026-11-20)
 
-## RESUME HERE (2026-11-17) — first lock-in test: locked, but residual signal unexplained
+## RESUME HERE (2026-11-20) — plan after the timing / offset review
+
+Read-only review of the 11-17 mode 9 data (`on1`, `mod0_1`) plus the manual /
+register PDFs. The 11-17 section below is still the record of the run; this
+section is what to do next. Items marked *superseded* below are replaced here.
+
+### Findings from re-analysing the 11-17 data
+- **RTD = 0 residual (12 counts) is a pure +12-count shift in Q** at the spot
+  (I unchanged: 605 → 605, Q: 578 internal → 590 external). Only where light
+  falls, ∝ intensity (~9 % of the PEM-on signal everywhere on the beam),
+  steady frame to frame, same phase in every pixel. Real PEM-driven 1f must
+  sit at the signal phase (2.93) or opposite (−0.21), not π/2 → most likely
+  an **ExtTqp-mode artefact that scales with DC light**, not optics.
+- **Internal-clock burst is not empty with the PEM on.** PEM-on minus RTD=0
+  (both internal, SensTqp=29): ~9–19 counts that **rotate ~0.4 rad/frame**
+  (≈1 turn over 16 frames), *plus* a non-rotating part (|mean z| = 6.9 vs
+  mean |z| = 15). Rotating part is consistent with the **3f harmonic
+  (150.07 kHz) leaking next to fd = 148.3 kHz** — but an ideal uniform
+  in-frame average predicts sinc(π·6.1) ≈ 1.6 % → <1 count, not ~15.
+  The static part is unexplained (candidate: PEM changes DC light via a J0
+  term from misalignment). → task 1.
+- Consequence: mode 9's internal-clock offset map is contaminated by both
+  effects. Offset-free comparison `on − mod0` (both external) gives
+  **139–140 counts at 2.93 rad** at the spot.
+- **Amplitude mode (CamMode 1/2) will not work for a steady lock-in signal.**
+  Both `OffsetMethod`s learn the offset from frames of the same volume
+  (first/last 2^NFrmAvg frames, or per-pixel histogram), which all contain the
+  signal. Simulated on `on1`: 139 counts with the RTD=0 offset → **3** (avg
+  of first 8 frames) / **2** (per-pixel median). Also drops phase (MOKE sign).
+- Ideal 4-sample lock-in: steady light → exactly 0 for any reference;
+  wrong frequency → (A/2)·sinc(π·Δf·T), rotating frame to frame, → 0 when
+  averaged as vectors. Responds at (4m±1)·fd, rejects DC and even multiples.
+  Anything non-rotating that survives at the wrong frequency = hardware or
+  setup error.
+
+### Tasks
+1. [ ] **Internal-clock residue hunt (PEM on).** Wrong internal fd should give
+   ≈0; find out why it doesn't. At each fd take PEM-on and RTD=0 runs with
+   the *same* SensTqp; RTD=0 is the zero. Sweep:
+   - SensTqp 26…33 (fd 156 → 139 kHz) across 3f = 150 kHz → response curve.
+   - Far from harmonics: SensTqp 20 (175.0 kHz), 39 (126.8 kHz), ~70 (~87.5 kHz).
+   - Per fd record: static part |mean z|, rotating part (frame-to-frame
+     spread), rotation per frame (→ solve for the leaking frequency; expect
+     150.07 kHz if 3f; needs the real frame period, frames assumed contiguous).
+   - Read-out: sinc-shaped peak with zeros → 3f, model OK; peak without zeros
+     → in-frame averaging not uniform; static part constant vs fd → DC/J0
+     effect, not frequency; ≈0 far from harmonics → off-harmonic internal run
+     is a valid zero for *internal* measurements (still not for ExtTqp, see 2).
+2. [ ] **Function-generator ExtTqp test** (is the Q shift built into ExtTqp,
+   or caused by the PEM reference waveform?). FG → encoder input, clean 50 %
+   square at 100 kHz, **PEM fully off** (rules out real modulation). Runs:
+   laser on vs beam blocked, same settings; look at (on − blocked) at the spot.
+   - ~12-count Q shift ∝ light → inherent to ExtTqp + DC light. Repeat at
+     45 % / 55 % duty to see if it depends on the gap lengths.
+   - No shift → it's the PEM reference (go to 3).
+   - Optional: PEM on, FG detuned (e.g. 110 kHz → fd 55 kHz) = "everything
+     on, nothing locked" baseline.
+   - ⚠ FG must drive the opto input properly: 4.5–6 V, 8–15 mA (manual
+     p.9–10); check what the heliDriver input expects before connecting.
+3. [ ] **Scope the PEM 2f reference**: duty cycle (shorter half sets the
+   SensTqp ceiling, (SensTqp+11)/35 MHz < T_pulsewidth), alternate periods
+   equal?, voltage/current vs opto spec. Record D-sub pins / channel.
+4. [ ] **SensTqp sweep in ExtTqp** 29 → ~140 (≤163 at 50 % duty, or below the
+   measured pulse width). Expect more signal; watch raw I/Q vs 0/1023 rails.
+   Note: (SensTqp+11)/35 MHz as integration time is the manual's §4.4
+   constraint, read as integration length — not stated outright.
+5. [ ] **Amplitude-mode offset methods**: one confirming run of
+   `OffsetMethod` 0 and 1 on the PEM-on signal. Expected to fail (see
+   findings); would only work if part of each volume is unmodulated (e.g.
+   `OffsetMethod=1, UseLastFrame=1` with modulation off at the end).
+6. [ ] **`ExtTqpPuls=1` wiring**: make sure only one encoder channel is driven
+   (both channels toggling → 4 edges/period → fd doubles).
+7. [ ] **Code**:
+   - Mode 9 zero/verdict from an **external-clock RTD = 0 run**, not the
+     internal-clock map.
+   - Frame time in ExtTqp mode: `FrmDur35MHz` and the frame-duration helper
+     in `helicam.py` (~l.1331) are computed from SensTqp, i.e. the internal
+     clock → wrong (≈3× too short at SensTqp=29). Measure time directly.
+   - Laser drift will show as baseline drift (Q shift ∝ DC light); consider
+     monitoring intensity.
+
+**On hold:** project z onto the locked phase axis instead of |z| (keeps MOKE
+sign, no noise bias); pump/probe via external start trigger (`TrigFreeExtN=0`:
+falling edge >10 µs on old units, opto 4.5–6 V / 8–15 mA on ours, one trigger
+= one volume, triggers ignored while `SensCfgBusy`, needs a timeout; demod
+phase vs trigger undocumented); compressed amplitude (`Comp11to8`, CamMode
+1/2 only, non-linear) for faster amplitude previews — not for steady mode.
+
+**Low priority:** knowledge base §6 "steady mode inherits SensTqp/SensNavM2"
+is probably moot — the register description lists both for CamModes
+0,1,2,4,5,7, not 3 (untested).
+
+---
+
+## (2026-11-17) — first lock-in test: locked, but residual signal unexplained
 
 ### Bench setup used
-- 632.8 nm cw laser, polarized 0° → PEM (Hinds) axis 45° → QWP 45° (parallel
+- 658 nm cw laser, polarized 0° → PEM (Hinds) axis 45° → QWP 45° (parallel
   to PEM) → analyzer 90° → heliCam. Hand-aligned, ~3–5° angle errors. Beam
   **loosely focused** on the sensor (spot ≈ 35 px at half max).
 - Ideal signal: `I = I0/2·[1 + 2J1(A)·sin ωt + 2J3(A)·sin 3ωt …]` → pure 1f.
@@ -81,9 +175,12 @@ rad), so it is likely ≥2 contributions. Candidates:
    wouldn't be spot-shaped, so less likely.
 
 To separate them:
-- [ ] **Beam blocked, ExtTqp on** → true external-clock offset map. Then
+- [ ] ~~**Beam blocked, ExtTqp on** → true external-clock offset map. Then
       `mod0 − blocked` = real residual with no offset mismatch, `on − blocked`
-      = full signal. If `mod0 − blocked` ≈ 0 → it was candidate 1.
+      = full signal. If `mod0 − blocked` ≈ 0 → it was candidate 1.~~
+      *Superseded (2026-11-20):* blocking removes the DC light, and the
+      light-dependent Q shift with it, so this can't separate candidate 1
+      from 2. Replaced by the function-generator test (task 2 above).
 - [ ] Residual vs light level (ND filters): offset artefact scales with DC
       intensity; a real modulation term also does — compare phase stability.
 - [ ] Rotate the analyzer 90°→0°: real 1f flips sign (phase +π); an offset
@@ -95,8 +192,9 @@ To separate them:
 - [ ] **Expand the beam** to fill a good part of the sensor (11.9 mm field),
       ND as needed. Watch clipping: raw I/Q at the spot already swung to
       ~390 from a ~600 baseline at 196 counts amplitude.
-- [ ] Rerun mode 9: `--note pem_on`, then RTD = 0 `--note pem_mod0`, then beam
-      blocked `--note blocked` (needed for the residual analysis above).
+- [ ] Rerun mode 9: `--note pem_on`, then RTD = 0 `--note pem_mod0`
+      (RTD = 0 is the zero). *The `--note blocked` run is superseded — see
+      task 2 above.*
 - [ ] Also try `--ext-sens-tqp 140` (integration ≈ full 5 µs quarter, ~4×
       more signal; keep < 164).
 - [ ] Record encoder D-sub pins / channel used, and set PEM WAV to 632.8.
