@@ -1026,6 +1026,14 @@ def mode8_fwhm_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float,
 F_SENSOR_HZ = 70e6
 
 
+def _peak_window(map2d, size=10):
+    """(row, col) slices of the size x size window with the largest sum of ``map2d``."""
+    cs = np.pad(map2d, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    box = cs[size:, size:] - cs[:-size, size:] - cs[size:, :-size] + cs[:-size, :-size]
+    r, c = (int(i) for i in np.unravel_index(np.argmax(box), box.shape))
+    return slice(r, r + size), slice(c, c + size)
+
+
 def _rawiq_burst(cam: HeliCamC3, label: str, n_acq: int, settings: dict):
     """
     Configure rawIQ with ``settings``, then time ``n_acq`` back-to-back
@@ -1088,13 +1096,14 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
     land at 148.3 kHz -- far from both lock hypotheses. It also gives both
     bursts the same integration length, so burst 1's offset map applies.
     """
-    sens_nav_m2, n_frames = 255, 16
+    SENSTQP = 28
+    sens_nav_m2, n_frames = 255, 32
     nc = 2 * sens_nav_m2 + 2
     common = {
         "SensNFrames": n_frames, "SensNavM2": sens_nav_m2, "BSEnable": 1, "CalDur1Cyc": 1,
         "DdsGain": 2, "TrigFreeExtN": 1,
     }
-    int_settings = {**common, "SensTqp": 29, "ExtTqp": 0, "ExtTqpPuls": 0}
+    int_settings = {**common, "SensTqp": SENSTQP, "ExtTqp": 0, "ExtTqpPuls": 0}
     ext_settings = {**common, "SensTqp": ext_sens_tqp, "ExtTqp": 1, "ExtTqpPuls": 1}
     if (ext_sens_tqp + 11) / 35e6 >= 0.5 / (2 * f_pem_hz):
         _log.warning("Mode 9: SensTqp=%d integrates %.2f us, >= the 2f reference half-period %.2f us "
@@ -1102,6 +1111,7 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
                      0.5 / (2 * f_pem_hz) * 1e6)
 
     int_vols, int_t = _rawiq_burst(cam, "internal", n_acq, int_settings)
+    cam.dump_registers(out_dir, "mode9_registers_internal")
     try:
         ext_vols, ext_t = _rawiq_burst(cam, "external", n_acq, ext_settings)
         cam.dump_registers(out_dir, "mode9_registers_external")
@@ -1124,7 +1134,7 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
     def _median_steady(ts):
         return float(np.median(ts[1:] if len(ts) > 1 else ts))
 
-    fd_int = F_SENSOR_HZ / (8 * (29 + 30))
+    fd_int = F_SENSOR_HZ / (8 * (SENSTQP + 30))
     tfr_int = (nc + 1) / fd_int
     t_int = _median_steady(int_t) / 1000.0
     t_usb = t_int / n_frames - tfr_int
@@ -1176,6 +1186,7 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
     summary = {
         "note": note, "f_pem_hz": f_pem_hz, "n_acq": n_acq, "SensNFrames": n_frames,
         "SensNavM2": sens_nav_m2, "ext_SensTqp": ext_sens_tqp,
+        "int_SensTqp": SENSTQP, "fd_int_hz": fd_int,
         "internal_ms_per_acq": int_t, "external_ms_per_acq": ext_t,
         "usb_overhead_ms_per_frame": t_usb * 1e3, "fd_ext_estimate_hz": fd_ext_est,
         "predictions_hz": predictions,
@@ -1203,6 +1214,40 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
         else:
             _log.info("Mode 9: VERDICT -- no coherent signal above the reference. Not locked, no light "
                       "modulation reaching the sensor, or the PEM is off.")
+        # Beam intensity: 10x10 window at the external |z| peak, same window for
+        # internal. Internal = rotating residue of acq 0: per-pixel rms over
+        # frames, and the coherent version (rms over frames of the window's
+        # vector sum) -- noise alone would make coherent ~ per-pixel sum / 10.
+        win, bg = _peak_window(ext_amp), _peak_window(-ext_amp)
+
+        def _z(vol):
+            d = vol.astype(np.float64) - offset
+            return d[..., 0] + 1j * d[..., 1]
+
+        def _residue(z, w):
+            dz = z[(slice(None),) + w] - z[(slice(None),) + w].mean(axis=0)
+            per_px = np.sqrt((np.abs(dz) ** 2).mean(axis=0)).sum()
+            coherent = np.sqrt((np.abs(dz.sum(axis=(1, 2))) ** 2).mean())
+            return float(per_px), float(coherent)
+
+        z_int, z_ext = _z(int_vols[0]), _z(ext_vols[0]).mean(axis=0)
+        int_px, int_coh_sum = _residue(z_int, win)
+        bg_px, bg_coh_sum = _residue(z_int, bg)
+        ext_vec = z_ext[win].sum()
+        peak = {
+            "rows": [win[0].start, win[0].stop], "cols": [win[1].start, win[1].stop],
+            "external_sum": float(ext_amp[win].sum()),
+            "external_vector_sum_acq0": float(np.abs(ext_vec)), "external_vector_phase_acq0": float(np.angle(ext_vec)),
+            "internal_residue_sum": int_px, "internal_residue_coherent_sum": int_coh_sum,
+            "bg_rows": [bg[0].start, bg[0].stop], "bg_cols": [bg[1].start, bg[1].stop],
+            "external_sum_bg": float(ext_amp[bg].sum()),
+            "internal_residue_sum_bg": bg_px, "internal_residue_coherent_sum_bg": bg_coh_sum,
+        }
+        _log.info("Mode 9: peak 10x10 at rows %d-%d cols %d-%d: external sum %.0f (vector %.0f), internal "
+                  "residue sum %.0f (coherent %.0f; noise alone ~%.0f); background window %.0f / %.0f",
+                  win[0].start, win[0].stop - 1, win[1].start, win[1].stop - 1, peak["external_sum"],
+                  peak["external_vector_sum_acq0"], int_px, int_coh_sum, int_px / 10,
+                  peak["external_sum_bg"], bg_px)
         for r, p in zip(ext_rows, acq_phase):
             r["roi_phase_rad"] = p
         save_table(out_dir, "mode9_external_per_acq", ext_rows)
@@ -1214,6 +1259,7 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
             "roi_pixels": n_roi, "roi_threshold": float(thresh),
             "roi_coherence_median": float(np.median(ext_coh[roi])) if n_roi else None,
             "roi_phase_per_acq_rad": acq_phase, "clipped_raw_fraction": clip_frac,
+            "peak_10x10": peak,
         })
 
         fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
@@ -1226,9 +1272,11 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
         ph = np.where(roi, ext_phases[0], np.nan)
         im = axes[3].imshow(ph, cmap="twilight", vmin=-np.pi, vmax=np.pi); fig.colorbar(im, ax=axes[3])
         axes[3].set_title("external phase, acq 0 (ROI only)")
+        for ax in axes:
+            ax.add_patch(plt.Rectangle((win[1].start - 0.5, win[0].start - 0.5), 10, 10, fill=False, ec="cyan"))
         fd_txt = f"{fd_ext_est / 1e3:.2f} kHz" if fd_ext_est else "n/a"
         fig.suptitle(f"Mode 9 ExtTqp lock check [{note}] -- f_PEM={f_pem_hz / 1e3:.3f} kHz, "
-                     f"estimated fd={fd_txt}")
+                     f"estimated fd={fd_txt}, internal SensTqp={SENSTQP} (fd={fd_int / 1e3:.2f} kHz)")
         fig.savefig(os.path.join(out_dir, "mode9_summary.png"))
 
     save_json(out_dir, "mode9_summary", summary)
