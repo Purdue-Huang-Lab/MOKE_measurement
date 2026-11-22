@@ -41,12 +41,12 @@ Mode 3 -- streaming:
     to 10 fps (throttled to the camera's own estimated acquire time if
     slower) with Pause / Start / Save frame / Move on buttons -> switch to
     amplitude mode -> stream again. Does NOT use auto_expose() -- see mode 4.
-    Uses cam.set_streaming_params()/cam.acquire_light() instead of
-    set_measurement_mode()/acquire_single() -- the latter flushes before
+    Uses cam.stream() (one set_measurement_mode(), then acquire_light()
+    repeatedly) instead of acquire_single() -- the latter flushes before
     every acquisition, which in volume modes (SensNFrames=256) costs a
     full extra acquisition per displayed frame (confirmed on real
     hardware: ~2x the predicted per-frame time). acquire_light() flushes
-    once at set_streaming_params() time instead of on every call.
+    once at configure time instead of on every call.
 
 Mode 4 -- auto_expose() checkout:
     open -> steady mode -> gain=1x (DdsGain=2) -> auto_expose() -> record
@@ -1023,7 +1023,7 @@ def mode8_fwhm_sweep(cam: HeliCamC3, out_dir: str, t_acquire_us: float,
 # Mode 9 -- ExtTqp lock check (PEM reference on the heliDriver encoder input)
 # ----------------------------------------------------------------------
 
-F_SENSOR_HZ = 70e6
+F_SENSOR_HZ = HeliCamC3.F_SENSOR_HZ
 
 
 def _peak_window(map2d, size=10):
@@ -1103,23 +1103,23 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
         "SensNFrames": n_frames, "SensNavM2": sens_nav_m2, "BSEnable": 1, "CalDur1Cyc": 1,
         "DdsGain": 2, "TrigFreeExtN": 1,
     }
-    int_settings = {**common, "SensTqp": SENSTQP, "ExtTqp": 0, "ExtTqpPuls": 0}
-    ext_settings = {**common, "SensTqp": ext_sens_tqp, "ExtTqp": 1, "ExtTqpPuls": 1}
+    fd_int = F_SENSOR_HZ / (8 * (SENSTQP + 30))
     if (ext_sens_tqp + 11) / 35e6 >= 0.5 / (2 * f_pem_hz):
         _log.warning("Mode 9: SensTqp=%d integrates %.2f us, >= the 2f reference half-period %.2f us "
                      "(manual §4.4 constraint)", ext_sens_tqp, (ext_sens_tqp + 11) / 35e6 * 1e6,
                      0.5 / (2 * f_pem_hz) * 1e6)
 
-    int_vols, int_t = _rawiq_burst(cam, "internal", n_acq, int_settings)
+    cam.set_internal_demod(fd_int)
+    int_vols, int_t = _rawiq_burst(cam, "internal", n_acq, common)
     cam.dump_registers(out_dir, "mode9_registers_internal")
     try:
-        ext_vols, ext_t = _rawiq_burst(cam, "external", n_acq, ext_settings)
+        cam.set_external_demod(ext_sens_tqp, both_channels=True)
+        ext_vols, ext_t = _rawiq_burst(cam, "external", n_acq, common)
         cam.dump_registers(out_dir, "mode9_registers_external")
     finally:
         # Never leave the camera on ExtTqp -- every later mode would stall
         # (or silently run off the PEM) without knowing why.
-        cam.set_attributes(AcqStop=1, ExtTqp=0, ExtTqpPuls=0)
-        cam.set_attributes(AcqStop=0)
+        cam.set_internal_demod(fd_int)
         _log.info("Mode 9: restored ExtTqp=0")
 
     if not int_vols:
@@ -1134,7 +1134,6 @@ def mode9_exttqp_lock(cam: HeliCamC3, out_dir: str, f_pem_hz: float, n_acq: int,
     def _median_steady(ts):
         return float(np.median(ts[1:] if len(ts) > 1 else ts))
 
-    fd_int = F_SENSOR_HZ / (8 * (SENSTQP + 30))
     tfr_int = (nc + 1) / fd_int
     t_int = _median_steady(int_t) / 1000.0
     t_usb = t_int / n_frames - tfr_int

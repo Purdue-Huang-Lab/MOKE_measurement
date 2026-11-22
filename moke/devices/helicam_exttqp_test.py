@@ -13,8 +13,8 @@ Usage::
     python -m moke.devices.helicam_exttqp_test --test start --trig both --note pem_on
     python -m moke.devices.helicam_exttqp_test --test start --trig ext --note pem_rtd0 --window 140 135
 
-Every acquisition's volume header is read from the SDK raw buffer (register
-description ch. 3; ``LibHeLIC.CamDataHdr``): sync word 0xC000, Nframes,
+Every acquisition's volume header is read with ``HeliCamC3.read_header()`` from the
+SDK raw buffer (register description ch. 3; ``LibHeLIC.CamDataHdr``): sync word 0xC000, Nframes,
 FrameDur (measured frame duration, 70 MHz ticks), ScanDuration / TimeStamp
 (system clock ticks), Nvolume, and one 16-bit zTag (quadrature position
 counter of IN3/IN4, manual §2.4.2) per frame. FrameDur gives the demod
@@ -71,7 +71,6 @@ from moke.devices.helicam_test import (
 _log = logging.getLogger(__name__)
 
 SYNCWORD = 0xC000
-HDR_WORDS = 1024                    # 2 kB header, LibHeLIC.CamDataHdr / GetCamArr's skip
 SENS_NAV_M2, N_FRAMES = 255, 32
 NC = 2 * SENS_NAV_M2 + 2
 
@@ -80,45 +79,9 @@ NC = 2 * SENS_NAV_M2 + 2
 # Header (encoder read format)
 # ----------------------------------------------------------------------
 
-def read_header(cam: HeliCamC3):
-    """
-    Parse the volume header of the last acquisition. Tries SDK buffer 0 (raw,
-    where the programmer manual reads zTags from) then buffer 1 (processed;
-    has the header only if its DP_ENCODER flag is set). Returns (dict, raw
-    header words as uint16) or (None, None) if no buffer carries the sync word.
-    """
-    for idx in (0, 1):
-        cd = cam.lib.GetCamData(idx, 0, 0)
-        if not cd or not cd.contents.data:
-            continue
-        words = np.frombuffer(ct.string_at(cd.contents.data, 2 * HDR_WORDS), dtype="<u2").copy()
-        # Sync word is at word 0 on our unit (run 001), not word 1 as in the
-        # register description / CamDataHdr; every other field is where they say.
-        if words[0] != SYNCWORD:
-            continue
-        h = LibHeLIC.CamDataHdr.from_buffer_copy(words.tobytes())
-        n = int(h.nFrames)
-        ztags = np.array(h.zTags[:min(n, 0x200)], dtype=np.uint16)
-        dz = np.diff(ztags.astype(np.int64))
-        dz = (dz + 2 ** 15) % 2 ** 16 - 2 ** 15                 # 16-bit wrap -> signed step
-        return {
-            "buffer": idx, "prop": int(cd.contents.prop),
-            "dp_encoder": bool(cd.contents.prop & LibHeLIC.CamDataProperty["DP_ENCODER"]),
-            "n_frames": n, "n_volume": int(h.nVolume),
-            "frm_dur_ticks": int(h.frmDur),
-            "scan_dur_ticks": int(h.scanDur[0]) + (int(h.scanDur[1]) << 32),
-            "time_stamp_ticks": int(h.timeStamp[0]) + (int(h.timeStamp[1]) << 32),
-            "ztags": ztags.tolist(),
-            "ztag_step_min": int(dz.min()) if dz.size else None,
-            "ztag_step_max": int(dz.max()) if dz.size else None,
-            "ztag_step_mean": float(dz.mean()) if dz.size else None,
-        }, words
-    return None, None
-
-
 def dump_buffer_info(cam: HeliCamC3, out_dir: str, label: str) -> None:
     """
-    Diagnostic for when read_header() finds no sync word: log what SDK buffers
+    Diagnostic for when cam.read_header() finds no sync word: log what SDK buffers
     0 and 1 actually are (size / format / prop), where 0xC000 occurs in their
     first and last 8 kB, and the FPGA header feature flags; save those bytes as
     ``<label>_buf<idx>_head.npy`` / ``_tail.npy`` (uint16) for offline digging.
@@ -166,7 +129,13 @@ def _burst(cam: HeliCamC3, out_dir: str, label: str, n_acq: int, settings: dict)
     frame mean (n_acq, H, W, 2) plus the first raw volume / header. Stops after
     2 consecutive failures (no pulses / no trigger costs seconds, not minutes).
     """
-    _timed(f"set_measurement_mode('rawIQ') [{label}]", cam.set_measurement_mode, "rawIQ", **settings)
+    demod = ("SensTqp", "ExtTqp", "ExtTqpPuls")
+    if settings["ExtTqp"]:
+        cam.set_external_demod(settings["SensTqp"], both_channels=bool(settings["ExtTqpPuls"]))
+    else:
+        cam.set_internal_demod(F_SENSOR_HZ / (8 * (settings["SensTqp"] + 30)))
+    mode_settings = {k: v for k, v in settings.items() if k not in demod}
+    _timed(f"set_measurement_mode('rawIQ') [{label}]", cam.set_measurement_mode, "rawIQ", **mode_settings)
     cam.dump_registers(out_dir, f"registers_{label}")
     means, rows = [], []
     n_fail = 0
@@ -182,7 +151,7 @@ def _burst(cam: HeliCamC3, out_dir: str, label: str, n_acq: int, settings: dict)
                 break
             continue
         n_fail = 0
-        hdr, words = read_header(cam)
+        hdr, words = cam.read_header()
         vol = cam.crop_unphysical(data).view(np.int16)
         if not means:
             np.save(os.path.join(out_dir, f"{label}_raw0.npy"), vol.copy())
@@ -242,10 +211,11 @@ def _config_summary(label, rows, settings, f_pem_hz=None):
     return s
 
 
-def _restore(cam: HeliCamC3):
+def _restore(cam: HeliCamC3, fd_int: float):
     # Never leave the camera on ExtTqp / external trigger -- every later mode
     # would stall (or silently run off the PEM) without knowing why.
-    cam.set_attributes(AcqStop=1, ExtTqp=0, ExtTqpPuls=0, TrigFreeExtN=1)
+    cam.set_internal_demod(fd_int)
+    cam.set_attributes(AcqStop=1, TrigFreeExtN=1)
     cam.set_attributes(AcqStop=0)
     _log.info("Restored ExtTqp=0, ExtTqpPuls=0, TrigFreeExtN=1")
 
@@ -300,7 +270,7 @@ def run_test(cam: HeliCamC3, out_dir: str, test: str, f_pem_hz: float, n_acq: in
             rows_all += rows
             results[label] = means
     finally:
-        _restore(cam)
+        _restore(cam, fd_int)
 
     if test == "puls":
         _log.info("puls: expected fd = f_PEM (%.1f Hz) for the active channel(s) seeing one 2f input; "

@@ -1,5 +1,40 @@
 # TODO / handoff — heliCam C3 driver work (updated 2026-11-22)
 
+## NEXT SESSION (2026-11-23) — amplitude and compressed-amplitude modes
+
+Goal: can CamMode 1 (amplitude) / compressed amplitude (`Comp11to8`) replace
+rawIQ for the lock-in, and how much faster are they?
+1. [ ] **Accuracy vs rawIQ.** Same beam, same demod settings (ExtTqp, PEM
+   1f trigger so all runs share one start state): rawIQ |z| (offset from an
+   RTD = 0 rawIQ run) vs amplitude vs compressed amplitude, at the 10×10 beam
+   window and pixel by pixel. Expect amplitude ×16 fixed point
+   (`data_reformat` divides by 16); check linearity over intensity (ND
+   filters) — `Comp11to8` is non-linear (register description appendix A1).
+2. [ ] **Offset calculation.** Both `OffsetMethod`s learn the offset from the
+   same volume, which kills a steady signal (simulated 139 → 3 / 2 counts,
+   see 2026-11-20 findings). Confirm on hardware, then test the way around
+   it: part of each volume unmodulated, e.g. `OffsetMethod=1, UseLastFrame=1`
+   with pump/PEM off at the end, or frame-alternating chopper (pump off
+   frames as the offset).
+3. [ ] **Speed.** Header ScanDuration / TimeStamp per acquisition for rawIQ
+   vs amplitude (half the bytes) vs compressed (8-bit) at SensNFrames 20 /
+   128 / 256: sensor time vs readout time per frame. Ties in with the
+   readout-cost sweep (Next item 3 below).
+
+Code state (2026-11-22, uncommitted): `HeliCamC3` reorganised into 7 groups
+(lifecycle, internal, settings, readback, acquisition, data processing,
+larger tasks); removed `arm`, `read_frame`, `set_demod_clock`,
+`set_internal_trigger`, `get_trigger_status`, `stream_on_trigger`,
+`compare_steady_settings_to_gui_reference`, `set_streaming_params`. New:
+`read_header()`, `set_external_demod()`; `set_internal_demod(f_hz)` now
+also clears ExtTqp and returns the actual fd; `_frame_duration_s` uses
+2·SensNavM2+3 and no longer the stale `FrmDur35MHz` register (always 23364).
+Usage examples: `python -m moke.devices.helicam --example
+steady|stream|internal|external`. Gap: no public per-frame rawIQ volume
+method (examples / acquire_single return the frame mean). Docs still naming
+removed methods: `device_interface_instruction.md`, `open_issue_helicam.md`,
+knowledge base.
+
 ## RESUME HERE (2026-11-22) — ref input, header, start trigger
 
 New test module `moke/devices/helicam_exttqp_test.py` (`--test header|puls|start`,
@@ -247,8 +282,9 @@ section is what to do next. Items marked *superseded* below are replaced here.
    `OffsetMethod` 0 and 1 on the PEM-on signal. Expected to fail (see
    findings); would only work if part of each volume is unmodulated (e.g.
    `OffsetMethod=1, UseLastFrame=1` with modulation off at the end).
-6. [ ] **`ExtTqpPuls=1` wiring**: make sure only one encoder channel is driven
+6. [x] **`ExtTqpPuls=1` wiring**: make sure only one encoder channel is driven
    (both channels toggling → 4 edges/period → fd doubles).
+   - both ExtTqpPuls=0 and ExtTqpPuls=1 works. 
 7. [ ] **Code**:
    - Mode 9 zero/verdict from an **external-clock RTD = 0 run**, not the
      internal-clock map.
