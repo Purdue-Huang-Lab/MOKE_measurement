@@ -1,4 +1,80 @@
-# TODO / handoff — heliCam C3 driver work (updated 2026-11-20)
+# TODO / handoff — heliCam C3 driver work (updated 2026-11-22)
+
+## RESUME HERE (2026-11-22) — ref input, header, start trigger
+
+New test module `moke/devices/helicam_exttqp_test.py` (`--test header|puls|start`,
+see its docstring). Data: `helicam_test_data/helicam_test_000`–`004`.
+
+### Volume header (encoder read format) — works
+- SDK buffer 0 (`GetCamData(0,0,0)`), first 2 kB, layout = `LibHeLIC.CamDataHdr`
+  **except the sync word 0xC000 is at word 0, not word 1** (run 000 missed it).
+- FrameDur (70 MHz ticks) → fd = (2·SensNavM2+3)·70 MHz / FrameDur. Internal
+  SensTqp 40: 124 999 vs 125 000 Hz → frame model confirmed. ExtTqp: 50 021.6–
+  50 021.9 Hz (scoped 2f/2 = 50 021.3). One value per volume, ~0.07 Hz/tick.
+  Replaces mode 9's wall-time model (old task 7 frame-time item).
+- ScanDuration clock ~200 MHz; 32 frames × 10.26 ms = 328 ms sensor time, but
+  TimeStamps ~680 ms apart → **~350 ms readout/processing per acquisition**.
+- Nvolume counts every volume since camera open (flush/warm-up show as gaps;
+  steps of 1 = none lost). FPGA feature flags read 0x0 (unreliable).
+- zTags (IN3/IN4 quadrature counter, per frame): bounce 1↔2 on internal clock,
+  constant in ExtTqp (frames locked to the reference).
+
+### ExtTqpPuls (old task 6) — done
+- ExtTqpPuls 0 and 1 both lock fd = f_PEM, no doubling → 2f on the default
+  channel, other input quiet. Wiring OK; 0 is marginally safer (pickup).
+
+### Start edge — PEM-locked trigger fixes it
+- Free-run (`TrigFreeExtN=1`): all 4 π/2 states, random. Amplitude depends on
+  state: ~7 % (003), up to **30 %** (004: 23.2k / 24.6k / 30.7k). States pair
+  (0/2 vs 1/3), steps alternate 1.48 / 1.66 rad. Guess (unproven): I/Q asymmetry
+  (gain or tap-dependent 3f alias); a plain offset error would split 0 vs 2.
+- PEM 1f → trigger, `TrigFreeExtN=0, ExtTqp=1, EnTrigOnPos=0` (004): 20/20 one
+  state, phase ±0.002 rad, amplitude ±0.4 %. 1f's 10 µs low time was enough.
+
+### Plan for pump-probe timing (decided 2026-11-22)
+- One acquisition = SensNFrames separate I/Q frames (rawIQ, not averaged on the
+  camera). PEM is demodulated **within** a frame; chopper alternates **between**
+  frames: frame ≤ one chopper half-period, even = on / odd = off, subtract as
+  vectors, repeat ~100× per delay. SensNFrames min is 10; use ~20, even, maybe
+  drop frame 0 (reads ~10 % high).
+- Frame time (2·SensNavM2+3)/f_PEM. Chopper ≈ 1/(2·frame time), within ~1 %
+  (20-frame volume ≈ 20 ms → negligible slip). Leave margin for blade transit.
+- **Trigger: flip-flop box (option 1).** Chopper sync re-timed to the PEM 1f by
+  a 74ACT74 (2 stages: pin 2 = chopper in, pins 3+11 = 1f, 5→12, pin 9 = out to
+  camera trigger, pins 1/4/10/13 → +5 V, 14 = +5 V, 7 = GND, 100 nF across).
+  Delay 20–40 µs. Gives a known pump state for frame 0 and a fixed PEM start state.
+  First test: 200 Hz function generator as "chopper", `--test start --trig ext`.
+- **Divider (option 2, only for 100+ frame volumes):** PEM 1f ÷ N as chopper
+  ext ref + camera trigger, N = 2·(frames per half)·(2·SensNavM2+3) exactly
+  (odd frame cycles → power-of-2 dividers never match). One frame per half:
+  SensNavM2 31 → 385 Hz (N 130), 61 → 200 Hz (N 250), 123 → 100 Hz (N 498).
+  Parts: CD74HC40103E (preset N/2) + spare 74ACT74 half as ÷2.
+- Duty cycle ≈ frame / (frame + ~11 ms readout per rawIQ frame, estimate):
+  ~8 % at 1 ms frames, ~29 % at 4.5 ms → slower chopper is more efficient
+  (laser OK at 100–400 Hz).
+- Plan doc §3 timing needs revising: it assumes per-half-period readout
+  (~300 µs) and arm/read per trigger; real camera = one trigger per volume,
+  frames back to back, readout afterwards. Also it demodulates at 2f; we run
+  1f (2f ref → fd = f_PEM); 2f demod would need a 4f ref or 2f in quadrature
+  on both encoder inputs.
+
+### Next
+1. [ ] Order (Monday 2026-11-23): SN74ACT74N ×3, CD74HC40103E ×2 (DIP "E";
+   check stock), 8-way DIP switch, 10 kΩ pull-ups, 830-pt breadboard(s),
+   jumper kit, 100 nF ×10, breadboard 5 V module. Digi-Key / Mouser.
+2. [ ] Build flip-flop on breadboard, scope check, then camera test with FG,
+   then real chopper sync.
+3. [ ] Measure readout cost: sweep SensNavM2 (23, 50, 255) × SensNFrames
+   (32, 128, 256), read ScanDuration / TimeStamp (needs `--sens-nav-m2` /
+   `--n-frames` flags in the test module).
+4. [ ] Frame-alternating pump test: chopper ≈ 1/(2·frame), 20-frame volumes,
+   check even/odd frames separate.
+5. [ ] Matched-SensTqp zero test at RTD = 0: `--test start --trig ext --note
+   pem_rtd0 --window 120 166`.
+6. [ ] Untested idea: chopper sync also on the unused encoder input
+   (ExtTqpPuls=0) → zTags record chopper state per frame.
+7. [ ] Still open: cause of the 0/2 vs 1/3 amplitude pairs; PEM drive current
+   and D-sub pins (task 3); PEM WAV 658 → 632.8 nm.
 
 ## RESUME HERE (2026-11-20 evening)
 
