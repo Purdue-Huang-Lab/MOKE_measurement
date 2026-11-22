@@ -1,5 +1,104 @@
 # TODO / handoff — heliCam C3 driver work (updated 2026-11-20)
 
+## RESUME HERE (2026-11-20 evening)
+
+### Data from today (`moke/devices/helicam_test_data/`)
+- `261120_acv/helicam_test_000`–`010`: morning internal-SensTqp scan, QWP at
+  0/90 (wrong), PEM on only, larger beam. Deck:
+  `261120_acv/senstqp_scan_summary_2026-11-20.pptx`.
+- Afternoon set 1 (QWP 0/90, runs 000–017, PEM on + RTD=0 pairs incl.
+  SensTqp 320): **raw folders no longer on disk** and its deck is gone too;
+  its numbers survive in the comparison slide of the QWP-45° deck.
+- `helicam_test_000`–`011`: **QWP at 45°** set, 6 internal SensTqp
+  (320, 145, 87, 58, 40, 28) × PEM on / RTD=0, 32 frames, ext SensTqp 29.
+  Deck: `senstqp_scan_summary_2026-11-20_qwp45.pptx` (incl. appendix of
+  report-image pairs). Labels: folder 009 note says tqp87, registers say 58.
+- `261120 summary.xlsx` (Int/Ext count = 10×10 window sums, column G =
+  data_check; RTD=0 rows numbered 10–15 = folders 006–011), backup
+  `261120 summary_backup_1657.xlsx`.
+
+### Bench note
+- QWP was at 0/90 (not ∥ PEM) for the morning and first afternoon sets →
+  light mostly 2f/4f, little 1f. **Residue numbers from those sets are
+  superseded.** Fixed to 45° for the last set.
+- PEM controller WAV was 658 nm, not 632.8 (A ≈ 1.92 instead of 1.84) —
+  check whether it is still set that way.
+
+### Task 1 result (QWP 45°) — internal-clock residue
+- Off-harmonic internal fd leaves **~1.3 counts/px coherent residue** at
+  125 kHz and at 25 kHz (f_PEM/2, SensTqp 320): ~1.5 % of the external
+  signal, ~4–6× the noise-only level; static part (on − RTD=0 offset map)
+  ≤ 0.3. RTD=0 rotating residue 0.3–0.5 (noise ≈ 0.2).
+- Larger near PEM lines: 11.9 at 150.9 kHz (≈ 3f), 8.7 at 99.4 kHz (2f),
+  4.1 at 74.8 kHz (2·fd ≈ 3f). Internal 1f / 2f ratio ≈ 50.
+- **But the internal burst is not yet a valid offset for ExtTqp data:**
+  RTD=0 external vs internal zero = 7–17 % of the signal at the beam
+  (9.1 counts, mostly Q, even at internal 28 vs external 29), light-dependent
+  → same question as old task 2 (Q shift built into ExtTqp?). Pending test:
+  matched off-harmonic SensTqp in both bursts (`SENSTQP = 40`,
+  `--ext-sens-tqp 40`), PEM on + RTD=0.
+- Unexplained: 42 counts at RTD=0 with fd ≈ f_PEM (~10 % of PEM on, also
+  ~9 % in the QWP 0/90 set; not seen by the PEM-locked external). In-frame
+  averaging looks non-uniform: 3f leak at SensTqp 28 is 11.9 vs 2.2 predicted
+  for a uniform average over the frame.
+
+### Task 3 done (2026-11-20) — PEM references scoped
+- f and 2f refs clean 0–5 V, 50 % duty, 50.0213 / 100.0426 kHz.
+- Still to record: drive current vs opto spec (8–15 mA at 4.5–6 V; 5 V is
+  the low edge) and D-sub pins / channel.
+
+### External phase / start edge
+- Locked within an acquisition: frame-to-frame scatter ≤ 0.01 rad.
+- Free-run acquisitions (`TrigFreeExtN=1`) start on one of the 4 reference
+  edges (`ExtTqpPuls=1`: both 2f flanks) → 4 phase states on a π/2 grid:
+  acq 0 of the 6 PEM-on runs agree mod π/2 to ±0.09 rad. Uneven spacing
+  (~1.42 / 1.72 rad) seen but weak evidence (1–2 runs per state); the
+  d ≈ 0.45 duty inference is withdrawn after scoping (50 %). If real,
+  candidate: opto rise/fall delay asymmetry (~0.5 µs).
+- Amplitude also changes with the state by ±10–15 % (see gain below).
+- Fix: `TrigFreeExtN=0, ExtTqp=1, EnTrigOnPos=0` (manual §4.4) with a
+  PEM-locked start trigger (e.g. 1f ref). Test: `--n-acq 20`, PEM on +
+  RTD=0, all acquisitions saved (mode 9 currently saves acq 0 only).
+- Mode 9's per-acquisition "ROI phase" is dominated by the offset-mismatch
+  vector (ROI ≈ whole frame) — don't use it for this.
+
+### Lock-in gain
+- Model: each tap integrates τ = (SensTqp+11)/35 MHz (our reading of manual
+  §4.4) → amplitude ∝ sin(πτ/T). Internal 145 vs external 29 on 1f: theory
+  3.61, measured 4.46.
+- Likely explanation (inference, unconfirmed): 3f aliases onto −fd in the
+  external (weight ≈ 0.96 × J3/J1 ≈ 0.19, sign depends on tap phase) →
+  3.61 / 0.81 ≈ 4.45. Implication for the ellipticity (1f) channel: up to
+  ~20 % tap-phase-dependent 3f error at A ≈ 1.9.
+- Absolute 1f/DC = 2·J1 ≈ 1.16 unchecked: rawIQ with `BSEnable=1` has no
+  DC → needs a CamMode 3 frame of the same beam.
+
+### Code state (`helicam_test.py` mode 9, committed in 3bd2876)
+- `SENSTQP` hard-codes the internal SensTqp (currently 28); used in
+  `int_settings` and the `fd_int` timing model; `int_SensTqp` / `fd_int_hz`
+  in the summary and plot title.
+- `mode9_registers_internal.json` dumped right after the internal burst.
+- `peak_10x10` block: external sum, vector sum + phase (acq 0), internal
+  residue + coherent residue, background window; cyan box on the plots.
+  Caveats: on RTD=0 runs the box sits off-beam (picked from that run's own
+  |z| map); internal metrics from acq 0 only.
+- `n_frames` currently 32. 64 is safe for memory; 256 needs `--n-acq ≤ 2`.
+- SensTqp max 4095 (fd 2.12 kHz); fd = 70 MHz / (8·(SensTqp+30));
+  f_PEM/2 → SensTqp 320.
+
+### Next, in order — then the lock-in camera is ready
+1. **Test ref input and encoder read format.** Start-trigger / start-edge
+   test (above), matched-SensTqp zero test (task 1 result), drive current
+   and pins (task 3), `ExtTqpPuls=1` single-channel wiring (old task 6),
+   Q-shift question (old task 2).
+2. **Make and improve lock-in amp mode or amp_compress mode.** Old task 5
+   caveat: amplitude-mode offsets learned from the same volume fail for a
+   steady signal; `Comp11to8` is non-linear. Mode 9 zero from an external
+   RTD=0 run and ExtTqp frame timing (old task 7).
+3. **Quantify lock-in gain.** External SensTqp sweep (old task 4) fitted to
+   sin(πτ/T); 3f alias check by grouping acquisitions by start state;
+   CamMode 3 frame for 1f/DC.
+
 ## RESUME HERE (2026-11-20) — plan after the timing / offset review
 
 Read-only review of the 11-17 mode 9 data (`on1`, `mod0_1`) plus the manual /
@@ -36,7 +135,9 @@ section is what to do next. Items marked *superseded* below are replaced here.
   setup error.
 
 ### Tasks
-1. [ ] **Internal-clock residue hunt (PEM on).** Wrong internal fd should give
+*(2026-11-20 evening: tasks 2, 4, 5, 6, 7 are folded into the ordered
+"Next" list in RESUME HERE (evening).)*
+1. [x] → see RESUME HERE (evening). **Internal-clock residue hunt (PEM on).** Wrong internal fd should give
    ≈0; find out why it doesn't. At each fd take PEM-on and RTD=0 runs with
    the *same* SensTqp; RTD=0 is the zero. Sweep:
    - SensTqp 26…33 (fd 156 → 139 kHz) across 3f = 150 kHz → response curve.
@@ -59,7 +160,7 @@ section is what to do next. Items marked *superseded* below are replaced here.
      on, nothing locked" baseline.
    - ⚠ FG must drive the opto input properly: 4.5–6 V, 8–15 mA (manual
      p.9–10); check what the heliDriver input expects before connecting.
-3. [ ] **Scope the PEM 2f reference**: duty cycle (shorter half sets the
+3. [x] (done 2026-11-20 except current / pins — see RESUME HERE (evening)) **Scope the PEM 2f reference**: duty cycle (shorter half sets the
    SensTqp ceiling, (SensTqp+11)/35 MHz < T_pulsewidth), alternate periods
    equal?, voltage/current vs opto spec. Record D-sub pins / channel.
 4. [ ] **SensTqp sweep in ExtTqp** 29 → ~140 (≤163 at 50 % duty, or below the
