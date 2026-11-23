@@ -40,6 +40,21 @@ png/npy/registers per example).
 - RTD: 0.293 λ is right for 1f demod (J1 max). Real MOKE (2f, analyzer 45°)
   would need 0.486 λ and a 4f reference. Check PEM WAV = laser wavelength.
 
+### Steady-state HDR (runs 004, 005 of 2026-11-23)
+- SDK DF_Hf stack = [long, short, (SensNFrames − SensNDarkFrames − 3 − 2)
+  HDR frames]; SDK merge = long below ~300, else 16 × short, without the
+  short channel's dark bias (−12 counts) → dips / ~190 counts low. Not used.
+- Ours: `steady_state_reformat_hdr(data, threshold=450)` = long < 450 else
+  ratio × (short − bias), bias from dark pixels (long < 5) of the same image.
+  `measure_steady_state(hdr=True)` (now the default; short-only with False).
+  Test scripts: `helicam_hdr_test.py`, `helicam_hdr_linearity_test.py`.
+- Linearity sweep 2–64 µs (005): bright groups flat ±1–3 % across the
+  long → short switch for t ≥ 16 µs. At 8 µs the short channel reads 0.69
+  of linear (short bias also varies: −6.7 / −10.3 / −11.4 counts at 2 / 4 /
+  ≥ 8 µs) → **use HDR with t_expose_us ≥ 16** when anything saturates.
+  `measure_steady_state`'s default t_expose_us is 10. Remaining ±5 % scatter
+  also in the long channel → probably laser drift, untested.
+
 ### Open
 - [ ] Cause of the ~10 % RTD = 0 residual (artefact vs real residual
   modulation); analyzer-flip / QWP-removal tests from 11-17 still apply.
