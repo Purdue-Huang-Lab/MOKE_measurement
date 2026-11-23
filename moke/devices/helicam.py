@@ -1697,7 +1697,7 @@ def example_steady_stream(cam: HeliCamC3, n_images: int = 20, t_expose_us: int =
     for k, img in enumerate(cam.stream("steady", n_frames=32, SensExpTime=t_expose_us, SensExpTimeMult=0)):
         print(f"stream image {k}: mean {img.mean():.1f}")
         if k + 1 >= n_images:
-            break
+            return img                                # last image
 
 
 def example_lockin_internal(cam: HeliCamC3, f_demod_hz: float = 50e3):

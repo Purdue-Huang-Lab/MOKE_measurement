@@ -1,27 +1,52 @@
-# TODO / handoff — heliCam C3 driver work (updated 2026-11-22)
+# TODO / handoff — heliCam C3 driver work (updated 2026-11-23)
 
-## NEXT SESSION (2026-11-23) — amplitude and compressed-amplitude modes
+## RESUME HERE (2026-11-23) — amplitude modes: closed, rawIQ only
 
-Goal: can CamMode 1 (amplitude) / compressed amplitude (`Comp11to8`) replace
-rawIQ for the lock-in, and how much faster are they?
-1. [ ] **Accuracy vs rawIQ.** Same beam, same demod settings (ExtTqp, PEM
-   1f trigger so all runs share one start state): rawIQ |z| (offset from an
-   RTD = 0 rawIQ run) vs amplitude vs compressed amplitude, at the 10×10 beam
-   window and pixel by pixel. Expect amplitude ×16 fixed point
-   (`data_reformat` divides by 16); check linearity over intensity (ND
-   filters) — `Comp11to8` is non-linear (register description appendix A1).
-2. [ ] **Offset calculation.** Both `OffsetMethod`s learn the offset from the
-   same volume, which kills a steady signal (simulated 139 → 3 / 2 counts,
-   see 2026-11-20 findings). Confirm on hardware, then test the way around
-   it: part of each volume unmodulated, e.g. `OffsetMethod=1, UseLastFrame=1`
-   with pump/PEM off at the end, or frame-alternating chopper (pump off
-   frames as the offset).
-3. [ ] **Speed.** Header ScanDuration / TimeStamp per acquisition for rawIQ
-   vs amplitude (half the bytes) vs compressed (8-bit) at SensNFrames 20 /
-   128 / 256: sensor time vs readout time per frame. Ties in with the
-   readout-cost sweep (Next item 3 below).
+Data: `helicam_test_data/helicam_test_000`–`003` of 2026-11-23 (000 = amp
+test, 001 = RTD not actually 0 — ignore, 002 = PEM on, 003 = RTD = 0; 002/003
+with `helicam_exttqp_test --test start --trig ext --window 120 130`).
+New code: `helicam_amp_test.py` (rawIQ vs amplitude vs compressed, accuracy +
+speed), `run_helicam_examples.py` (runs the 4 `helicam.py` examples, saves
+png/npy/registers per example).
 
-Code state (2026-11-22, uncommitted): `HeliCamC3` reorganised into 7 groups
+### Amplitude / compressed amplitude — not usable for PEM-locked signals
+- Run 000: amplitude and compressed both ≈ 2 counts/px **everywhere** (beam =
+  background = |z| noise floor); rawIQ window 10 087. Frames 0–3 read 0.
+- Cause: the camera learns each pixel's offset from the same volume
+  (`OffsetMethod` histogram / average of 2^NFrmAvg frames); no register loads
+  an external offset. A locked signal is identical in every frame → absorbed
+  into the offset. Not a usage error.
+- Only loophole: offset frames (first/last 2^NFrmAvg, contiguous) all pump-off
+  → amplitude = |pump-induced Δz| (sign lost, noise-biased, no coherent
+  averaging). Incompatible with frame-by-frame chopping. **Decision: rawIQ
+  for MOKE.**
+- Speed (32 frames, SensNavM2 255, sensor 328 ms in all modes): rawIQ 11.5 MB
+  / readout 352 ms / start-to-start 681 ms; amplitude 5.3 MB / 160 / 488;
+  compressed 2.6 MB / 79 / 408 → readout ≈ 30 ms/MB.
+- Bug found and fixed: 000's first internal acquisition was a stale 1 536-byte
+  transfer that went into the rawIQ offset (000's rawIQ numbers slightly
+  off); `helicam_amp_test` now skips short transfers.
+
+### rawIQ offset (PEM 1f trigger, matched SensTqp 40)
+- RTD = 0 residual vs internal-clock offset = **10.7 %** of PEM-on at the
+  window (1 882 vs 17 609), 10.6 % over the beam. Almost pure I (−0.04 rad),
+  not a scaled copy of the signal (−0.42 rad). Stable: 18/20 within ±1 %,
+  two acquisitions +9 % / +0.13 rad.
+- Offset-free PEM signal (002 − 003): 15 878 at −0.47 rad.
+- → Static measurements: subtract an RTD = 0 run with identical settings
+  (internal map overstates by ~11 %). Pump-probe: z_on − z_off cancels it.
+- PEM frequency shifts with retardation: 50 022.7 Hz (0.293 λ) vs
+  50 019.4 Hz (RTD = 0); the lock follows.
+- RTD: 0.293 λ is right for 1f demod (J1 max). Real MOKE (2f, analyzer 45°)
+  would need 0.486 λ and a 4f reference. Check PEM WAV = laser wavelength.
+
+### Open
+- [ ] Cause of the ~10 % RTD = 0 residual (artefact vs real residual
+  modulation); analyzer-flip / QWP-removal tests from 11-17 still apply.
+- [ ] Remaining "Next" items from 2026-11-22 below (flip-flop box, readout
+  sweep, frame-alternating pump test).
+
+Code state (2026-11-22, committed 1a4df00): `HeliCamC3` reorganised into 7 groups
 (lifecycle, internal, settings, readback, acquisition, data processing,
 larger tasks); removed `arm`, `read_frame`, `set_demod_clock`,
 `set_internal_trigger`, `get_trigger_status`, `stream_on_trigger`,
