@@ -1448,6 +1448,48 @@ class HeliCamC3(Device):
         phase = np.arctan2(Qc, Ic)
         return amplitude, phase
 
+    def steady_state_reformat_hdr(self, data, threshold: float = 450.0) -> np.ndarray:
+        """
+        HDR image from a raw steady-state (CamMode 3) acquisition, in
+        long-exposure units: the long channel where it is below
+        ``threshold``, else ratio x (short - short_bias).
+
+        Our own version of the SDK's DF_Hf merge (helicam_test_004 of
+        2026-11-23): the SDK switches at long ~300 and uses 16 x short
+        without correcting the short channel's dark bias (-12 counts there),
+        so its bright values come out ~190 low and dip below the long image
+        just above the switch. Here the bias is measured from dark pixels
+        (long < 5 counts) of the same image; if fewer than 100 such pixels
+        exist it is taken as 0 and a warning is logged. ``ratio`` is the
+        live SensExpRatio factor (SENSEXPRATIO_SHORT_LONG). Long saturates
+        at ~500 counts after dark subtraction, hence threshold 450.
+
+        Parameters
+        ----------
+        data:
+            Raw array from ``_acquire()`` in CamMode 3.
+        threshold:
+            Long-channel level (dark-subtracted counts) above which the
+            scaled short channel is used.
+
+        Returns
+        -------
+        np.ndarray
+            (292, 280) float64.
+        """
+        ch = self._dark_subtract_channels(self.crop_unphysical(data))    # (H, W, 2): [long, short]
+        long_, short = ch[..., 0], ch[..., 1]
+        ratio = self.SENSEXPRATIO_SHORT_LONG[self.get_attribute("SensExpRatio")]
+        dark = long_ < 5
+        if dark.sum() >= 100:
+            short_bias = float(np.median(short[dark]))
+        else:
+            short_bias = 0.0
+            _log.warning("steady_state_reformat_hdr: only %d dark pixels, short-channel bias not corrected",
+                         int(dark.sum()))
+        _log.debug("steady_state_reformat_hdr: ratio %d, short bias %.2f", ratio, short_bias)
+        return np.where(long_ < threshold, long_, ratio * (short - short_bias))
+
     # ------------------------------------------------------------------
     # 6. Larger tasks
     # ------------------------------------------------------------------
@@ -1661,15 +1703,20 @@ class HeliCamC3(Device):
                 "nominal_ratio": nominal_ratio, "floor_limited": False,
                 "ceiling_not_found": False, "table": table}
 
-    def measure_steady_state(self, n_frames: int = 256, t_expose_us: float = 10):
+    def measure_steady_state(self, n_frames: int = 256, t_expose_us: float = 10, hdr: bool = True):
         """
-        Measure steady state intensity map.
+        Measure steady state intensity map: the short-exposure image by
+        default, or with ``hdr=True`` the long/short merge from
+        ``steady_state_reformat_hdr()`` (long-exposure units).
         """
         self.set_measurement_mode("steady")
         self.set_acquire_time(t_expose_us)
         self.set_attributes(SensNFrames=n_frames)
-        data = self.acquire_single()
-        return data
+        if not hdr:
+            return self.acquire_single()
+        self.flush()
+        data = self._acquire()
+        return None if data is None else self.steady_state_reformat_hdr(data)
 
 # ----------------------------------------------------------------------
 # Usage examples -- run one against real hardware:
